@@ -41,7 +41,8 @@ std::string format_size(size_t bytes) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <number_of_points>\n";
+        std::cerr << "Usage: " << argv[0] << " <number_of_points> [output.bin]\n"
+                  << "  output.bin defaults to data/points.bin\n";
         return 1;
     }
 
@@ -51,10 +52,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    size_t already = file_point_count("points.bin");
+    std::string outPath = (argc >= 3) ? argv[2] : "data/points.bin";
+
+    size_t already = file_point_count(outPath);
     if (already >= totalPoints) {
-        size_t fileSize = get_file_size("points.bin");
-        std::cout << "File already contains " << already << " points (" 
+        size_t fileSize = get_file_size(outPath);
+        std::cout << "File already contains " << already << " points ("
                   << format_size(fileSize) << "). Nothing to do.\n";
         return 0;
     }
@@ -62,7 +65,7 @@ int main(int argc, char** argv) {
     size_t toGenerate = totalPoints - already;
     size_t numVectors = (toGenerate + POINTS_PER_VECTOR - 1) / POINTS_PER_VECTOR;
 
-    std::ofstream outFile("points.bin", std::ios::binary | std::ios::app);
+    std::ofstream outFile(outPath, std::ios::binary | std::ios::app);
     if (!outFile) {
         std::cerr << "Error opening file for writing!\n";
         return 1;
@@ -101,9 +104,10 @@ int main(int argc, char** argv) {
 
     outFile.close();
 
-    size_t finalSize = get_file_size("points.bin");
-    std::cout << "\nFile updated: now contains " << totalPoints << " points\n";
-    std::cout << "File size: " << format_size(finalSize) 
+    size_t finalSize = get_file_size(outPath);
+    std::cout << "\nFile updated: " << outPath << "\n"
+              << "  Points: " << totalPoints << "\n"
+              << "  Size:   " << format_size(finalSize)
               << " (" << finalSize << " bytes)\n";
     
     return 0;

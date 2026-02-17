@@ -1,0 +1,81 @@
+# ================================================================
+# Makefile — STR R-Tree GPU bulk-loader
+# ================================================================
+#
+# Directory layout:
+#   src/   source files
+#   bin/   compiled executables        (run from project root)
+#   data/  input/output .bin datasets
+#   tmp/   intermediate sort files     (auto-cleaned)
+#
+# Quick start:
+#   make                                   # build everything
+#   ./bin/gen_points 1000000000            # generate 1B points -> data/points.bin
+#   ./bin/external_str data/points.bin data/rtree.bin
+# ================================================================
+
+SRC_DIR  := src
+BIN_DIR  := bin
+DATA_DIR := data
+TMP_DIR  := tmp
+
+NVCC      := nvcc
+CXX       := g++
+NVCCFLAGS := -O3 -std=c++17
+CXXFLAGS  := -O3 -std=c++17
+
+# ----------------------------------------------------------------
+# Default target
+# ----------------------------------------------------------------
+.PHONY: all
+all: $(BIN_DIR)/external_str $(BIN_DIR)/gen_points $(BIN_DIR)/gpu_info
+
+# ----------------------------------------------------------------
+# Binaries
+# ----------------------------------------------------------------
+$(BIN_DIR)/external_str: $(SRC_DIR)/external_str_cuda.cu $(SRC_DIR)/constants.h
+	$(NVCC) $(NVCCFLAGS) $< -o $@ 
+
+$(BIN_DIR)/gen_points: $(SRC_DIR)/gen_points.cpp
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+$(BIN_DIR)/gpu_info: $(SRC_DIR)/gpu_info.cu
+	$(NVCC) $(NVCCFLAGS) $< -o $@
+
+# ----------------------------------------------------------------
+# Utility targets
+# ----------------------------------------------------------------
+.PHONY: clean clean-tmp clean-data help
+
+# Remove compiled binaries (keeps directories)
+clean:
+	rm -f $(BIN_DIR)/external_str $(BIN_DIR)/gen_points $(BIN_DIR)/gpu_info
+
+# Remove intermediate sort files left in tmp/
+clean-tmp:
+	find $(TMP_DIR) -name "*.bin" -o -name "*.tmp" | xargs rm -f
+
+# Remove dataset files in data/
+clean-data:
+	find $(DATA_DIR) -name "*.bin" | xargs rm -f
+
+# ----------------------------------------------------------------
+# Help
+# ----------------------------------------------------------------
+help:
+	@echo ""
+	@echo "  make                 Build all executables -> bin/"
+	@echo "  make external_str    Build the STR R-Tree bulk-loader"
+	@echo "  make gen_points      Build the point generator"
+	@echo "  make gpu_info        Build the GPU info tool"
+	@echo ""
+	@echo "  make clean           Remove compiled binaries"
+	@echo "  make clean-tmp       Remove intermediate files in tmp/"
+	@echo "  make clean-data      Remove dataset files in data/"
+	@echo ""
+	@echo "Usage:"
+	@echo "  ./bin/gpu_info"
+	@echo "  ./bin/gen_points <N>                        # writes data/points.bin"
+	@echo "  ./bin/gen_points <N> <output>               # writes to custom path"
+	@echo "  ./bin/external_str data/points.bin data/rtree.bin"
+	@echo ""

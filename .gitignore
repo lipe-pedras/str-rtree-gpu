@@ -1,19 +1,24 @@
-# Build files
-*.o
-*.out
-str_knn
-obj/
-bin/
+# ── Compiled binaries ──────────────────────────────────────
+bin/*
+!bin/.gitkeep
 
-# Dataset files
+# ── Dataset files ──────────────────────────────────────────
+data/*
+!data/.gitkeep
+
+# ── Intermediate sort/tmp files ────────────────────────────
+tmp/*
+!tmp/.gitkeep
+
+# ── Old build artifacts (legacy, when building inside src/) ─
+src/*.o
+src/external_str
+src/gen_points
+src/gpu_info
 *.bin
-
-# Temporary files
-/tmp/str_block_*.tmp
-/tmp/str_gpu_block_*.tmp
 *.tmp
 
-# Python
+# ── Python ─────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
@@ -22,16 +27,16 @@ __pycache__/
 env/
 venv/
 
-# IDE
+# ── IDE ────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS
+# ── OS ─────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Logs
+# ── Logs ───────────────────────────────────────────────────
 *.log

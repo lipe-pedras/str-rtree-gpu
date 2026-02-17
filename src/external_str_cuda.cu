@@ -897,7 +897,11 @@ void external_str_disk(const std::string& input,
               << slice * sizeof(Point) / (1024.0*1024.0) << " MB)\n";
 
     // Temp file for sorted points (tree goes into final output)
-    const std::string sorted_tmp = "sorted_str.tmp";
+    const std::string sorted_tmp  = "tmp/sorted_str.tmp";
+    const std::string sorted_x    = "tmp/sorted_x.bin";
+
+    // Ensure tmp/ exists
+    std::filesystem::create_directories("tmp");
 
     auto wall_start = Clock::now();
 
@@ -908,7 +912,7 @@ void external_str_disk(const std::string& input,
     g_stats = {};  // reset for phase 1
     auto phase1_start = Clock::now();
 
-    size_t runs = generate_runs(input, SORT_CHUNK_POINTS, true, "x_run_");
+    size_t runs = generate_runs(input, SORT_CHUNK_POINTS, true, "tmp/x_run_");
     TimingStats gen_stats = g_stats;
     gen_stats.print("Phase 1a \u2014 Generate X-sorted runs");
 
@@ -917,7 +921,7 @@ void external_str_disk(const std::string& input,
     while (runs > 1) {
         std::cout << "  Merge round " << merge_round++ << " : "
                   << runs << " runs" << std::endl;
-        runs = merge_pass(runs, "x_run_", "x_tmp_", true);
+        runs = merge_pass(runs, "tmp/x_run_", "tmp/x_tmp_", true);
     }
     TimingStats merge_stats = g_stats;
     merge_stats.print("Phase 1b \u2014 Merge X-sorted runs");
@@ -926,7 +930,7 @@ void external_str_disk(const std::string& input,
     std::cout << "Phase 1 wall time: "
               << Ms(phase1_end - phase1_start).count() << " ms\n";
 
-    std::filesystem::rename("x_tmp_0.bin", "sorted_x.bin");
+    std::filesystem::rename("tmp/x_tmp_0.bin", sorted_x);
 
     // =====================================================
     // 2) STR TILING
@@ -946,7 +950,7 @@ void external_str_disk(const std::string& input,
         cudaMallocHost(&sbufs[i], slice_bytes);
 
     {
-        std::ifstream in("sorted_x.bin", std::ios::binary);
+        std::ifstream in(sorted_x, std::ios::binary);
         std::ofstream out(sorted_tmp, std::ios::binary);
 
         // Pre-read first slice
@@ -1085,7 +1089,7 @@ void external_str_disk(const std::string& input,
 
     // Clean up temp file
     std::filesystem::remove(sorted_tmp);
-    std::filesystem::remove("sorted_x.bin");
+    std::filesystem::remove(sorted_x);
 
     // =====================================================
     // Grand total
