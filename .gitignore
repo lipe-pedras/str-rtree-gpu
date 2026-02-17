@@ -1,0 +1,37 @@
+# Build files
+*.o
+*.out
+str_knn
+obj/
+bin/
+
+# Dataset files
+*.bin
+
+# Temporary files
+/tmp/str_block_*.tmp
+/tmp/str_gpu_block_*.tmp
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

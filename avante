@@ -1,0 +1,20 @@
+-----------------------------
+    FASE BULK LOAD
+
+ordenar os pontos (STR / HILBERT / Z-ORDER?) e construir a arvore, salvar como binário.
+
+implementação atual
+    STR com o sort X em GPU divido em chunks.
+    Merge dos chunks em CPU. (dá pra melhorar isso daqui)
+    Segue com sort em Y para cada slice em X, feito em GPU.
+    Constrói a árvore em CPU e salva em binário.
+
+    NOTE: dá pra melhorar o o uso da RAM, reduzindo o I/O. (aqui é trabalhar cache)
+
+-----------------------------
+    FASE QUERY
+
+sistema de cache (LRU?) do disco para a GPU (aqui entra tudo de threads, pinned memory, mmap e as otimizações maneiras)
+└── multiplas querys? perguntas importantes para o cache.
+
+calculos de distância da KNN e avante.
