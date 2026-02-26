@@ -508,11 +508,26 @@ void kway_merge_files(size_t run_count,
 // =========================================================
 
 size_t compute_str_slice_size(size_t total_points) {
-    size_t num_leaves = (total_points + RTREE_NODE_CAPACITY - 1) / RTREE_NODE_CAPACITY;
+    size_t cap = RTREE_NODE_CAPACITY;
+    size_t num_leaves = (total_points + cap - 1) / cap;
     size_t num_slices = (size_t)std::ceil(std::sqrt((double)num_leaves));
-    size_t ideal_slice = (total_points + num_slices - 1) / num_slices;
-    // Cap at GPU sort capacity
-    return std::min(ideal_slice, (size_t)STR_MAX_SLICE);
+
+    // Leaves per slice, rounded UP to a multiple of `cap` so that
+    // level-1 internal node boundaries coincide with slice boundaries.
+    // Without this, an internal node can straddle two slices whose
+    // Y-sort domains are in different X-ranges, producing spatially
+    // disjoint MBRs among its children.
+    size_t leaves_per_slice = (num_leaves + num_slices - 1) / num_slices;
+    leaves_per_slice = ((leaves_per_slice + cap - 1) / cap) * cap;
+
+    size_t slice_points = leaves_per_slice * cap;
+
+    // Cap at GPU sort capacity, keeping cap² alignment.
+    size_t cap2 = cap * cap;
+    size_t max_slice = (STR_MAX_SLICE / cap2) * cap2;
+    if (max_slice < cap2) max_slice = cap2;
+
+    return std::min(slice_points, max_slice);
 }
 
 // =========================================================
@@ -871,8 +886,8 @@ void external_str_disk(const std::string& input,
     std::cout << "\n*** DISK PATH (dataset exceeds RAM budget) ***\n";
 
     size_t slice = compute_str_slice_size(total_points);
-    // Align slice to RTREE_NODE_CAPACITY so per-slice leaf counts
-    // sum to the same total as ceil(total_points / RTREE_NODE_CAPACITY).
+    // compute_str_slice_size already returns a cap²-aligned value,
+    // but enforce cap alignment as a safety net.
     slice = std::max((slice / RTREE_NODE_CAPACITY) * RTREE_NODE_CAPACITY,
                      RTREE_NODE_CAPACITY);
     std::cout << "STR slice size:     " << slice << " points ("
