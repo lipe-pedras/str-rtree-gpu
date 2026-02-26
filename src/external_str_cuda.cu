@@ -28,6 +28,7 @@
 #include <chrono>
 #include <future>
 #include <algorithm>
+#include <queue>
 
 #include "constants.h"
 
@@ -227,94 +228,6 @@ void gpu_sort_reuse(Point* host_data, size_t n, bool by_x, Point* d_ptr_raw) {
 }
 
 // =========================================================
-// CPU MERGE (two sorted files) — streaming, with timing
-// =========================================================
-
-void merge_files(const std::string& fileA,
-                 const std::string& fileB,
-                 const std::string& output,
-                 bool by_x) {
-
-    // I/O buffer size (per stream). Merge is O(n) and I/O-bound,
-    // so CPU is fine here — the GPU pays off in sort (O(n log n)).
-    constexpr size_t IO_BUF = 16 * 1024 * 1024;  // 16M points = 128 MB
-
-    std::ifstream fA(fileA, std::ios::binary);
-    std::ifstream fB(fileB, std::ios::binary);
-    std::ofstream fOut(output, std::ios::binary);
-
-    std::vector<Point> bufA(IO_BUF), bufB(IO_BUF), bufOut(IO_BUF);
-
-    size_t posA = 0, endA = 0;
-    size_t posB = 0, endB = 0;
-    size_t posOut = 0;
-    bool eofA = false, eofB = false;
-
-    auto refill = [&](std::ifstream& f, std::vector<Point>& buf,
-                      size_t& pos, size_t& end, bool& eof) {
-        auto t0 = Clock::now();
-        f.read(reinterpret_cast<char*>(buf.data()), IO_BUF * sizeof(Point));
-        end = f.gcount() / sizeof(Point);
-        pos = 0;
-        auto t1 = Clock::now();
-        g_stats.disk_read_ms += Ms(t1 - t0).count();
-        g_stats.bytes_read   += end * sizeof(Point);
-        if (end == 0) eof = true;
-    };
-
-    auto flush_out = [&]() {
-        if (posOut == 0) return;
-        auto t0 = Clock::now();
-        fOut.write(reinterpret_cast<char*>(bufOut.data()),
-                   posOut * sizeof(Point));
-        auto t1 = Clock::now();
-        g_stats.disk_write_ms += Ms(t1 - t0).count();
-        g_stats.bytes_written += posOut * sizeof(Point);
-        posOut = 0;
-    };
-
-    auto cmp = [by_x](const Point& a, const Point& b) {
-        return by_x ? (a.x < b.x) : (a.y < b.y);
-    };
-
-    // Initial fill
-    refill(fA, bufA, posA, endA, eofA);
-    refill(fB, bufB, posB, endB, eofB);
-
-    // Two-way merge
-    while (!eofA && !eofB) {
-        if (cmp(bufA[posA], bufB[posB])) {
-            bufOut[posOut++] = bufA[posA++];
-            if (posA >= endA) refill(fA, bufA, posA, endA, eofA);
-        } else {
-            bufOut[posOut++] = bufB[posB++];
-            if (posB >= endB) refill(fB, bufB, posB, endB, eofB);
-        }
-        if (posOut >= IO_BUF) flush_out();
-    }
-
-    // Drain remainder of A
-    while (!eofA) {
-        bufOut[posOut++] = bufA[posA++];
-        if (posA >= endA) refill(fA, bufA, posA, endA, eofA);
-        if (posOut >= IO_BUF) flush_out();
-    }
-
-    // Drain remainder of B
-    while (!eofB) {
-        bufOut[posOut++] = bufB[posB++];
-        if (posB >= endB) refill(fB, bufB, posB, endB, eofB);
-        if (posOut >= IO_BUF) flush_out();
-    }
-
-    flush_out();
-
-    fA.close();
-    fB.close();
-    fOut.close();
-}
-
-// =========================================================
 // Generate initial sorted runs (GPU) — triple-buffered pipeline
 //
 // Overlaps disk I/O with GPU sort using 3 pinned host buffers:
@@ -453,32 +366,141 @@ size_t generate_runs(const std::string& input,
 }
 
 // =========================================================
-// Pairwise GPU merge pass
+// K-way merge: merges all run files in a single pass.
+// Uses buffered readers + min-heap.  Deletes inputs after use.
 // =========================================================
 
-size_t merge_pass(size_t run_count,
-                  const std::string& prefix_in,
-                  const std::string& prefix_out,
-                  bool by_x) {
-
-    size_t new_runs = 0;
-
-    for (size_t i = 0; i < run_count; i += 2) {
-        std::string A = prefix_in + std::to_string(i) + ".bin";
-
-        if (i + 1 >= run_count) {
-            std::filesystem::rename(A,
-                prefix_out + std::to_string(new_runs++) + ".bin");
-            break;
-        }
-
-        std::string B = prefix_in + std::to_string(i + 1) + ".bin";
-        std::string OUT = prefix_out + std::to_string(new_runs++) + ".bin";
-
-        merge_files(A, B, OUT, by_x);
+void kway_merge_files(size_t run_count,
+                      const std::string& prefix,
+                      const std::string& output_path,
+                      bool by_x) {
+    if (run_count == 0) return;
+    if (run_count == 1) {
+        std::filesystem::rename(prefix + "0.bin", output_path);
+        return;
     }
 
-    return new_runs;
+    // Buffer size per stream: balance RAM usage vs I/O throughput.
+    // Total merge memory ≈ (run_count + 1) × buf_points × sizeof(Point).
+    constexpr size_t MAX_MERGE_MEM  = 2ULL * 1024 * 1024 * 1024; // 2 GB
+    constexpr size_t MIN_BUF_POINTS = 4096;
+    constexpr size_t MAX_BUF_POINTS = 16 * 1024 * 1024;          // 128 MB
+
+    size_t buf_points = MAX_MERGE_MEM / ((run_count + 1) * sizeof(Point));
+    buf_points = std::max(buf_points, MIN_BUF_POINTS);
+    buf_points = std::min(buf_points, MAX_BUF_POINTS);
+
+    std::cout << "  K-way merge: " << run_count << " runs, "
+              << buf_points << " pts/buf ("
+              << buf_points * sizeof(Point) / (1024.0*1024.0) << " MB)\n";
+
+    // --- Buffered reader per run ---
+    struct RunReader {
+        std::ifstream file;
+        std::vector<Point> buf;
+        size_t pos = 0, end = 0;
+        bool eof = false;
+        std::string path;
+
+        void open(const std::string& p, size_t buf_sz) {
+            path = p;
+            buf.resize(buf_sz);
+            file.open(p, std::ios::binary);
+            refill();
+        }
+
+        void refill() {
+            if (eof) return;
+            auto t0 = Clock::now();
+            file.read(reinterpret_cast<char*>(buf.data()),
+                      buf.size() * sizeof(Point));
+            end = file.gcount() / sizeof(Point);
+            pos = 0;
+            auto t1 = Clock::now();
+            g_stats.disk_read_ms += Ms(t1 - t0).count();
+            g_stats.bytes_read   += end * sizeof(Point);
+            if (end == 0) eof = true;
+        }
+
+        const Point& current() const { return buf[pos]; }
+
+        bool advance() {
+            pos++;
+            if (pos >= end) {
+                refill();
+                if (eof) return false;
+            }
+            return true;
+        }
+
+        void close_and_delete() {
+            file.close();
+            std::filesystem::remove(path);
+        }
+    };
+
+    std::vector<RunReader> readers(run_count);
+    for (size_t i = 0; i < run_count; i++)
+        readers[i].open(prefix + std::to_string(i) + ".bin", buf_points);
+
+    // --- Min-heap of (point, run_index) ---
+    struct HeapEntry {
+        Point  pt;
+        size_t run;
+    };
+
+    auto cmp = [by_x](const HeapEntry& a, const HeapEntry& b) {
+        // Inverted: std::priority_queue is a max-heap, so "greater" → min-heap
+        return by_x ? (a.pt.x > b.pt.x) : (a.pt.y > b.pt.y);
+    };
+
+    std::vector<HeapEntry> heap;
+    heap.reserve(run_count);
+
+    // Seed heap with one entry per run
+    for (size_t i = 0; i < run_count; i++) {
+        if (!readers[i].eof)
+            heap.push_back({readers[i].current(), i});
+    }
+    std::make_heap(heap.begin(), heap.end(), cmp);
+
+    // --- Output buffer ---
+    std::vector<Point> out_buf(buf_points);
+    size_t out_pos = 0;
+
+    std::ofstream fout(output_path, std::ios::binary);
+
+    auto flush_out = [&]() {
+        if (out_pos == 0) return;
+        auto t0 = Clock::now();
+        fout.write(reinterpret_cast<char*>(out_buf.data()),
+                   out_pos * sizeof(Point));
+        auto t1 = Clock::now();
+        g_stats.disk_write_ms += Ms(t1 - t0).count();
+        g_stats.bytes_written += out_pos * sizeof(Point);
+        out_pos = 0;
+    };
+
+    // --- Merge loop ---
+    while (!heap.empty()) {
+        std::pop_heap(heap.begin(), heap.end(), cmp);
+        HeapEntry top = heap.back();
+        heap.pop_back();
+
+        out_buf[out_pos++] = top.pt;
+        if (out_pos >= buf_points) flush_out();
+
+        RunReader& r = readers[top.run];
+        if (r.advance()) {
+            heap.push_back({r.current(), top.run});
+            std::push_heap(heap.begin(), heap.end(), cmp);
+        } else {
+            r.close_and_delete();
+        }
+    }
+
+    flush_out();
+    fout.close();
 }
 
 // =========================================================
@@ -491,6 +513,64 @@ size_t compute_str_slice_size(size_t total_points) {
     size_t ideal_slice = (total_points + num_slices - 1) / num_slices;
     // Cap at GPU sort capacity
     return std::min(ideal_slice, (size_t)STR_MAX_SLICE);
+}
+
+// =========================================================
+// Pre-compute total number of R-tree nodes.
+// No data access needed — purely structural computation.
+// =========================================================
+
+size_t precompute_num_nodes(size_t total_points, size_t capacity) {
+    size_t level = (total_points + capacity - 1) / capacity;  // leaves
+    size_t total = level;
+    while (level > 1) {
+        level = (level + capacity - 1) / capacity;
+        total += level;
+    }
+    return total;
+}
+
+// =========================================================
+// Build internal R-tree levels from a vector of leaf nodes.
+// Appends internal nodes to `nodes`. Sets height_out.
+// =========================================================
+
+void build_internal_levels(std::vector<RTreeNode>& nodes,
+                           size_t num_leaves,
+                           size_t capacity,
+                           uint32_t& height_out) {
+    height_out = 1;
+    size_t level_start = 0;
+    size_t level_count = num_leaves;
+
+    while (level_count > 1) {
+        size_t next_count = (level_count + capacity - 1) / capacity;
+
+        for (size_t i = 0; i < next_count; i++) {
+            size_t s   = level_start + i * capacity;
+            size_t cnt = std::min(capacity, level_count - i * capacity);
+
+            MBR m{INFINITY, INFINITY, -INFINITY, -INFINITY};
+            for (size_t j = 0; j < cnt; j++) {
+                const MBR& c = nodes[s + j].mbr;
+                m.min_x = std::min(m.min_x, c.min_x);
+                m.min_y = std::min(m.min_y, c.min_y);
+                m.max_x = std::max(m.max_x, c.max_x);
+                m.max_y = std::max(m.max_y, c.max_y);
+            }
+
+            RTreeNode nd{};
+            nd.mbr          = m;
+            nd.first_child  = s;
+            nd.num_children = (uint32_t)cnt;
+            nd.is_leaf      = 0;
+            nodes.push_back(nd);
+        }
+
+        level_start += level_count;
+        level_count  = next_count;
+        height_out++;
+    }
 }
 
 // =========================================================
@@ -570,77 +650,6 @@ std::vector<RTreeNode> build_rtree(const Point* points,
     return nodes;
 }
 
-// --- Build from sorted file on disk (streams points for leaf MBRs) ---
-std::vector<RTreeNode> build_rtree_from_file(const std::string& sorted_file,
-                                             size_t num_points,
-                                             size_t capacity,
-                                             uint32_t& height_out) {
-    std::vector<RTreeNode> nodes;
-    size_t num_leaves = (num_points + capacity - 1) / capacity;
-    nodes.reserve(num_leaves * 2);
-
-    // Stream through sorted file to compute leaf MBRs
-    std::ifstream in(sorted_file, std::ios::binary);
-    std::vector<Point> buf(capacity);
-
-    for (size_t i = 0; i < num_leaves; i++) {
-        size_t cnt = std::min(capacity, num_points - i * capacity);
-        in.read(reinterpret_cast<char*>(buf.data()), cnt * sizeof(Point));
-
-        MBR m{INFINITY, INFINITY, -INFINITY, -INFINITY};
-        for (size_t j = 0; j < cnt; j++) {
-            m.min_x = std::min(m.min_x, buf[j].x);
-            m.min_y = std::min(m.min_y, buf[j].y);
-            m.max_x = std::max(m.max_x, buf[j].x);
-            m.max_y = std::max(m.max_y, buf[j].y);
-        }
-
-        RTreeNode nd{};
-        nd.mbr          = m;
-        nd.first_child  = i * capacity;
-        nd.num_children = (uint32_t)cnt;
-        nd.is_leaf      = 1;
-        nodes.push_back(nd);
-    }
-    in.close();
-
-    // Internal levels (identical to in-memory path)
-    height_out = 1;
-    size_t level_start = 0;
-    size_t level_count = num_leaves;
-
-    while (level_count > 1) {
-        size_t next_count = (level_count + capacity - 1) / capacity;
-
-        for (size_t i = 0; i < next_count; i++) {
-            size_t s   = level_start + i * capacity;
-            size_t cnt = std::min(capacity, level_count - i * capacity);
-
-            MBR m{INFINITY, INFINITY, -INFINITY, -INFINITY};
-            for (size_t j = 0; j < cnt; j++) {
-                const MBR& c = nodes[s + j].mbr;
-                m.min_x = std::min(m.min_x, c.min_x);
-                m.min_y = std::min(m.min_y, c.min_y);
-                m.max_x = std::max(m.max_x, c.max_x);
-                m.max_y = std::max(m.max_y, c.max_y);
-            }
-
-            RTreeNode nd{};
-            nd.mbr          = m;
-            nd.first_child  = s;
-            nd.num_children = (uint32_t)cnt;
-            nd.is_leaf      = 0;
-            nodes.push_back(nd);
-        }
-
-        level_start += level_count;
-        level_count  = next_count;
-        height_out++;
-    }
-
-    return nodes;
-}
-
 // =========================================================
 // Write R-Tree to disk
 //
@@ -672,44 +681,6 @@ void write_rtree_file(const std::string& path,
               nodes.size() * sizeof(RTreeNode));
     out.write(reinterpret_cast<const char*>(points),
               num_points * sizeof(Point));
-    out.close();
-
-    std::cout << "  R-Tree written: " << nodes.size() << " nodes, "
-              << height << " levels, root MBR = ["
-              << nodes.back().mbr.min_x << ", "
-              << nodes.back().mbr.min_y << "] x ["
-              << nodes.back().mbr.max_x << ", "
-              << nodes.back().mbr.max_y << "]\n";
-}
-
-// Variant: write header+nodes, then copy points from a file
-void write_rtree_file_from_sorted(const std::string& path,
-                                  const std::vector<RTreeNode>& nodes,
-                                  uint32_t height,
-                                  const std::string& sorted_points_file,
-                                  size_t num_points) {
-    RTreeHeader hdr{};
-    hdr.magic         = 0x52545245;
-    hdr.node_capacity = (uint32_t)RTREE_NODE_CAPACITY;
-    hdr.height        = height;
-    hdr.num_points    = num_points;
-    hdr.num_nodes     = nodes.size();
-
-    std::ofstream out(path, std::ios::binary);
-    out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
-    out.write(reinterpret_cast<const char*>(nodes.data()),
-              nodes.size() * sizeof(RTreeNode));
-
-    // Stream-copy sorted points
-    constexpr size_t COPY_BUF = 16 * 1024 * 1024;  // 128 MB
-    std::vector<Point> buf(COPY_BUF);
-    std::ifstream in(sorted_points_file, std::ios::binary);
-    while (in) {
-        in.read(reinterpret_cast<char*>(buf.data()), COPY_BUF * sizeof(Point));
-        size_t n = in.gcount();
-        if (n > 0) out.write(reinterpret_cast<char*>(buf.data()), n);
-    }
-    in.close();
     out.close();
 
     std::cout << "  R-Tree written: " << nodes.size() << " nodes, "
@@ -884,6 +855,13 @@ void external_str_inmemory(const std::string& input,
 
 // =========================================================
 // DISK-BASED STR PATH (triple-buffered, for large datasets)
+//
+// Optimizations over naive approach:
+//   - K-way merge in Phase 1b (single pass instead of log2(k))
+//   - Leaf MBR computation fused into Phase 2 Y-sort pipeline
+//   - Points written directly to output file (no intermediate temp)
+//   - Pre-computed R-tree layout allows seeking in output
+//   - Run files deleted as consumed during merge
 // =========================================================
 
 void external_str_disk(const std::string& input,
@@ -893,12 +871,14 @@ void external_str_disk(const std::string& input,
     std::cout << "\n*** DISK PATH (dataset exceeds RAM budget) ***\n";
 
     size_t slice = compute_str_slice_size(total_points);
+    // Align slice to RTREE_NODE_CAPACITY so per-slice leaf counts
+    // sum to the same total as ceil(total_points / RTREE_NODE_CAPACITY).
+    slice = std::max((slice / RTREE_NODE_CAPACITY) * RTREE_NODE_CAPACITY,
+                     RTREE_NODE_CAPACITY);
     std::cout << "STR slice size:     " << slice << " points ("
               << slice * sizeof(Point) / (1024.0*1024.0) << " MB)\n";
 
-    // Temp file for sorted points (tree goes into final output)
-    const std::string sorted_tmp  = "tmp/sorted_str.tmp";
-    const std::string sorted_x    = "tmp/sorted_x.bin";
+    const std::string sorted_x = "tmp/sorted_x.bin";
 
     // Ensure tmp/ exists
     std::filesystem::create_directories("tmp");
@@ -906,7 +886,7 @@ void external_str_disk(const std::string& input,
     auto wall_start = Clock::now();
 
     // =====================================================
-    // 1) GLOBAL SORT BY X (external, GPU merge)
+    // 1) GLOBAL SORT BY X (generate runs + k-way merge)
     // =====================================================
 
     g_stats = {};  // reset for phase 1
@@ -917,30 +897,37 @@ void external_str_disk(const std::string& input,
     gen_stats.print("Phase 1a \u2014 Generate X-sorted runs");
 
     g_stats = {};
-    size_t merge_round = 0;
-    while (runs > 1) {
-        std::cout << "  Merge round " << merge_round++ << " : "
-                  << runs << " runs" << std::endl;
-        runs = merge_pass(runs, "tmp/x_run_", "tmp/x_tmp_", true);
-    }
+    kway_merge_files(runs, "tmp/x_run_", sorted_x, true);
     TimingStats merge_stats = g_stats;
-    merge_stats.print("Phase 1b \u2014 Merge X-sorted runs");
+    merge_stats.print("Phase 1b \u2014 K-way merge X-sorted runs");
 
     auto phase1_end = Clock::now();
     std::cout << "Phase 1 wall time: "
               << Ms(phase1_end - phase1_start).count() << " ms\n";
 
-    std::filesystem::rename("tmp/x_tmp_0.bin", sorted_x);
-
     // =====================================================
-    // 2) STR TILING
-    // Divide sorted_x into vertical slices
-    // Each slice is sorted by Y independently
-    // Write sorted points to temp file
+    // 2) STR TILING + R-TREE BUILD + WRITE OUTPUT
+    //
+    // Fused pipeline: reads X-sorted data from sorted_x,
+    // Y-sorts each slice on GPU, computes leaf MBRs inline,
+    // and writes sorted points directly to the output file.
+    // Eliminates the intermediate sorted_str.tmp entirely.
     // =====================================================
 
     g_stats = {};  // reset for phase 2
     auto phase2_start = Clock::now();
+
+    // Pre-compute R-tree layout (purely structural, no data needed)
+    size_t num_nodes   = precompute_num_nodes(total_points, RTREE_NODE_CAPACITY);
+    size_t num_leaves  = (total_points + RTREE_NODE_CAPACITY - 1) / RTREE_NODE_CAPACITY;
+    size_t points_offset = sizeof(RTreeHeader) + num_nodes * sizeof(RTreeNode);
+
+    std::cout << "  Pre-computed: " << num_nodes << " total nodes, "
+              << num_leaves << " leaves, points offset = "
+              << points_offset / (1024.0*1024.0) << " MB\n";
+
+    std::vector<RTreeNode> nodes;
+    nodes.reserve(num_nodes);
 
     size_t slice_bytes = slice * sizeof(Point);
 
@@ -949,9 +936,25 @@ void external_str_disk(const std::string& input,
     for (int i = 0; i < 3; i++)
         cudaMallocHost(&sbufs[i], slice_bytes);
 
+    size_t points_written = 0;  // tracks global point offset for leaf MBRs
+
     {
         std::ifstream in(sorted_x, std::ios::binary);
-        std::ofstream out(sorted_tmp, std::ios::binary);
+
+        // Open output file — reserve space for header+nodes at the front.
+        // We'll seek back and write them after all points are in place.
+        std::ofstream out(output, std::ios::binary);
+        {
+            constexpr size_t ZBUF_SZ = 1024 * 1024;  // 1 MB chunks
+            std::vector<char> zbuf(std::min(points_offset, ZBUF_SZ), 0);
+            size_t remaining = points_offset;
+            while (remaining > 0) {
+                size_t w = std::min(remaining, ZBUF_SZ);
+                out.write(zbuf.data(), w);
+                remaining -= w;
+            }
+        }
+        // File cursor now at points_offset — ready for point data
 
         // Pre-read first slice
         auto tr0 = Clock::now();
@@ -969,7 +972,7 @@ void external_str_disk(const std::string& input,
         bool   input_done  = (n0 == 0);
 
         while (sort_n > 0) {
-            // 1) Async read next slice
+            // 1) Async read next slice from sorted_x
             std::future<std::pair<size_t, double>> read_fut;
             bool do_read = !input_done;
             if (do_read) {
@@ -984,7 +987,7 @@ void external_str_disk(const std::string& input,
                     });
             }
 
-            // 2) Async write previous sorted slice
+            // 2) Async write previous Y-sorted slice directly to output
             std::future<double> write_fut;
             bool do_write = (write_idx >= 0);
             if (do_write) {
@@ -1003,7 +1006,34 @@ void external_str_disk(const std::string& input,
             // 3) GPU sort current slice by Y (overlaps with I/O)
             gpu_sort(sbufs[sort_idx], sort_n, false);
 
-            // 4) Collect async results
+            // 4) Compute leaf MBRs for the just-sorted slice (data is cache-hot)
+            {
+                size_t cap = RTREE_NODE_CAPACITY;
+                size_t nleaves = (sort_n + cap - 1) / cap;
+                for (size_t li = 0; li < nleaves; li++) {
+                    size_t start = li * cap;
+                    size_t cnt = std::min(cap, sort_n - start);
+
+                    MBR m{INFINITY, INFINITY, -INFINITY, -INFINITY};
+                    for (size_t j = 0; j < cnt; j++) {
+                        const Point& p = sbufs[sort_idx][start + j];
+                        m.min_x = std::min(m.min_x, p.x);
+                        m.min_y = std::min(m.min_y, p.y);
+                        m.max_x = std::max(m.max_x, p.x);
+                        m.max_y = std::max(m.max_y, p.y);
+                    }
+
+                    RTreeNode nd{};
+                    nd.mbr          = m;
+                    nd.first_child  = points_written + start;
+                    nd.num_children = (uint32_t)cnt;
+                    nd.is_leaf      = 1;
+                    nodes.push_back(nd);
+                }
+                points_written += sort_n;
+            }
+
+            // 5) Collect async results
             size_t next_n = 0;
             if (do_read) {
                 std::pair<size_t, double> res = read_fut.get();
@@ -1018,7 +1048,7 @@ void external_str_disk(const std::string& input,
                 g_stats.bytes_written += write_n * sizeof(Point);
             }
 
-            // 5) Rotate buffers
+            // 6) Rotate buffers
             write_idx = sort_idx;
             write_n   = sort_n;
             sort_n    = next_n;
@@ -1033,7 +1063,7 @@ void external_str_disk(const std::string& input,
             }
         }
 
-        // Flush last sorted slice
+        // Flush last sorted slice to output
         if (write_idx >= 0) {
             auto tw0 = Clock::now();
             out.write(reinterpret_cast<char*>(sbufs[write_idx]),
@@ -1049,47 +1079,51 @@ void external_str_disk(const std::string& input,
 
     for (int i = 0; i < 3; i++) cudaFreeHost(sbufs[i]);
 
+    // Build internal R-tree levels from the leaf nodes computed inline
+    auto t_tree0 = Clock::now();
+    uint32_t height;
+    assert(nodes.size() == num_leaves);
+    build_internal_levels(nodes, num_leaves, RTREE_NODE_CAPACITY, height);
+    assert(nodes.size() == num_nodes);
+    auto t_tree1 = Clock::now();
+    double tree_ms = Ms(t_tree1 - t_tree0).count();
+
+    // Write header + nodes at the beginning of the output file
+    // (points are already in place after the reserved space)
+    auto t_hdr0 = Clock::now();
+    {
+        RTreeHeader hdr{};
+        hdr.magic         = 0x52545245;  // "RTRE"
+        hdr.node_capacity = (uint32_t)RTREE_NODE_CAPACITY;
+        hdr.height        = height;
+        hdr.num_points    = total_points;
+        hdr.num_nodes     = nodes.size();
+
+        std::fstream fout(output, std::ios::binary | std::ios::in | std::ios::out);
+        fout.seekp(0);
+        fout.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+        fout.write(reinterpret_cast<const char*>(nodes.data()),
+                   nodes.size() * sizeof(RTreeNode));
+        fout.close();
+    }
+    auto t_hdr1 = Clock::now();
+    double hdr_ms = Ms(t_hdr1 - t_hdr0).count();
+
+    std::cout << "  R-Tree written: " << nodes.size() << " nodes, "
+              << height << " levels, root MBR = ["
+              << nodes.back().mbr.min_x << ", "
+              << nodes.back().mbr.min_y << "] x ["
+              << nodes.back().mbr.max_x << ", "
+              << nodes.back().mbr.max_y << "]\n";
+
+    // Clean up temp files
+    std::filesystem::remove(sorted_x);
+
     auto phase2_end = Clock::now();
     TimingStats tile_stats = g_stats;
-    tile_stats.print("Phase 2 \u2014 STR Y-sort tiling");
+    tile_stats.print("Phase 2 \u2014 STR Y-sort + R-Tree build + direct write");
     std::cout << "Phase 2 wall time: "
               << Ms(phase2_end - phase2_start).count() << " ms\n";
-
-    // =====================================================
-    // 3) BUILD R-TREE
-    // Stream the sorted points file to compute leaf MBRs,
-    // then build internal levels bottom-up in memory.
-    // =====================================================
-
-    auto phase3_start = Clock::now();
-    uint32_t height;
-    std::vector<RTreeNode> nodes = build_rtree_from_file(
-        sorted_tmp, total_points, RTREE_NODE_CAPACITY, height);
-    auto phase3_end = Clock::now();
-    double tree_ms = Ms(phase3_end - phase3_start).count();
-
-    std::cout << "\n===== Timing: Phase 3 \u2014 Build R-Tree =====\n"
-              << std::fixed << std::setprecision(2)
-              << "  Tree build:  " << tree_ms << " ms\n"
-              << "  Nodes:       " << nodes.size() << "\n"
-              << "  Height:      " << height << "\n"
-              << "  Leaf nodes:  "
-              << ((total_points + RTREE_NODE_CAPACITY - 1) / RTREE_NODE_CAPACITY)
-              << "\n";
-
-    // =====================================================
-    // 4) WRITE FINAL R-TREE FILE
-    // Header + Nodes + Points (copied from sorted temp)
-    // =====================================================
-
-    auto phase4_start = Clock::now();
-    write_rtree_file_from_sorted(output, nodes, height, sorted_tmp, total_points);
-    auto phase4_end = Clock::now();
-    double write_ms = Ms(phase4_end - phase4_start).count();
-
-    // Clean up temp file
-    std::filesystem::remove(sorted_tmp);
-    std::filesystem::remove(sorted_x);
 
     // =====================================================
     // Grand total
@@ -1106,9 +1140,10 @@ void external_str_disk(const std::string& input,
 
     auto wall_end = Clock::now();
     std::cout << std::fixed << std::setprecision(2)
-              << "  R-Tree build:      " << tree_ms << " ms\n"
-              << "  R-Tree file write: " << write_ms << " ms  ("
-              << out_bytes / (1024.0*1024.0) << " MB)\n"
+              << "  R-Tree build:      " << tree_ms << " ms  ("
+              << num_nodes << " nodes)\n"
+              << "  Header+nodes write:" << hdr_ms << " ms  ("
+              << points_offset / (1024.0*1024.0) << " MB)\n"
               << "\nTotal wall-clock time: "
               << Ms(wall_end - wall_start).count() / 1000.0
               << " s\n";
