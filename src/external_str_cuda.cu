@@ -513,28 +513,19 @@ void kway_merge_files(size_t run_count,
 
 size_t compute_str_slice_size(size_t total_points) {
     size_t leaf_cap = RTREE_LEAF_CAPACITY;
-    size_t int_cap  = RTREE_INTERNAL_CAPACITY;
     size_t num_leaves = (total_points + leaf_cap - 1) / leaf_cap;
     size_t num_slices = (size_t)std::ceil(std::sqrt((double)num_leaves));
 
-    // Leaves per slice, rounded UP to a multiple of `int_cap` so that
-    // level-1 internal node boundaries coincide with slice boundaries.
-    // Without this, an internal node can straddle two slices whose
-    // Y-sort domains are in different X-ranges, producing spatially
-    // disjoint MBRs among its children.
+    // Leaves per slice, rounded UP to a multiple of `leaf_cap` so that
+    // leaf boundaries align with slice boundaries (each leaf is a full
+    // group of points).  No need to align to `int_cap` because
+    // sort_nodes_str() re-sorts every level before grouping into parents.
     size_t leaves_per_slice = (num_leaves + num_slices - 1) / num_slices;
-    leaves_per_slice = ((leaves_per_slice + int_cap - 1) / int_cap) * int_cap;
 
     size_t slice_points = leaves_per_slice * leaf_cap;
 
-    // Cap at GPU sort capacity, keeping leaf_cap × int_cap alignment.
-    size_t align = leaf_cap * int_cap;
-    size_t max_slice = (STR_MAX_SLICE / align) * align;
-    if (max_slice < align) {
-        std::cout << "Warning: STR_MAX_SLICE too small for leaf/internal node alignment\n";
-        max_slice = align;
-    }
-    return std::min(slice_points, max_slice);
+    // Cap at GPU sort capacity.
+    return std::min(slice_points, STR_MAX_SLICE);
 }
 
 // =========================================================
@@ -555,8 +546,53 @@ size_t precompute_num_nodes(size_t total_points,
 }
 
 // =========================================================
+// STR sort a contiguous range of RTreeNode entries.
+// Sorts by MBR center X globally, then by MBR center Y
+// within each vertical slice.  Slice sizes are aligned to
+// `group_cap` so that parent-node boundaries coincide with
+// slice boundaries.
+// =========================================================
+
+void sort_nodes_str(std::vector<RTreeNode>& nodes,
+                    size_t level_start,
+                    size_t level_count,
+                    size_t group_cap) {
+    if (level_count <= group_cap) return;  // single parent — nothing to tile
+
+    auto begin = nodes.begin() + level_start;
+
+    // Number of parent groups that will be formed from this level
+    size_t num_groups = (level_count + group_cap - 1) / group_cap;
+    size_t num_slices = (size_t)std::ceil(std::sqrt((double)num_groups));
+
+    // Nodes per slice, rounded UP to a multiple of group_cap so that
+    // parent-node boundaries never straddle two slices.
+    size_t nodes_per_slice = (level_count + num_slices - 1) / num_slices;
+    nodes_per_slice = ((nodes_per_slice + group_cap - 1) / group_cap) * group_cap;
+
+    // 1) Sort entire level by MBR center X  (min_x+max_x is monotonically
+    //    equivalent to (min_x+max_x)/2, so we skip the division).
+    std::sort(begin, begin + level_count,
+              [](const RTreeNode& a, const RTreeNode& b) {
+                  return (a.mbr.min_x + a.mbr.max_x) <
+                         (b.mbr.min_x + b.mbr.max_x);
+              });
+
+    // 2) Within each vertical slice, sort by MBR center Y.
+    for (size_t off = 0; off < level_count; off += nodes_per_slice) {
+        size_t cnt = std::min(nodes_per_slice, level_count - off);
+        std::sort(begin + off, begin + off + cnt,
+                  [](const RTreeNode& a, const RTreeNode& b) {
+                      return (a.mbr.min_y + a.mbr.max_y) <
+                             (b.mbr.min_y + b.mbr.max_y);
+                  });
+    }
+}
+
+// =========================================================
 // Build internal R-tree levels from a vector of leaf nodes.
 // Appends internal nodes to `nodes`. Sets height_out.
+// Each level is STR-sorted before grouping into parents.
 // =========================================================
 
 void build_internal_levels(std::vector<RTreeNode>& nodes,
@@ -568,6 +604,9 @@ void build_internal_levels(std::vector<RTreeNode>& nodes,
     size_t level_count = num_leaves;
 
     while (level_count > 1) {
+        // STR-sort this level before grouping into parents
+        sort_nodes_str(nodes, level_start, level_count, internal_cap);
+
         size_t next_count = (level_count + internal_cap - 1) / internal_cap;
 
         for (size_t i = 0; i < next_count; i++) {
@@ -638,12 +677,15 @@ std::vector<RTreeNode> build_rtree(const Point* points,
         nodes.push_back(nd);
     }
 
-    // Internal levels (bottom-up)
+    // Internal levels (bottom-up, STR-sorted at each level)
     height_out = 1;
     size_t level_start = 0;
     size_t level_count = num_leaves;
 
     while (level_count > 1) {
+        // STR-sort this level before grouping into parents
+        sort_nodes_str(nodes, level_start, level_count, internal_cap);
+
         size_t next_count = (level_count + internal_cap - 1) / internal_cap;
 
         for (size_t i = 0; i < next_count; i++) {
