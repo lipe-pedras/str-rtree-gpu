@@ -104,6 +104,8 @@ struct Point {
 };
 
 static_assert(sizeof(Point) == 8);
+static_assert(RTREE_NODE_BYTES / sizeof(Point) == RTREE_LEAF_CAPACITY,
+              "RTREE_LEAF_CAPACITY out of sync with Point size");
 
 // =========================================================
 // R-Tree structures
@@ -122,12 +124,14 @@ struct RTreeNode {
 };
 
 static_assert(sizeof(RTreeNode) == 32);
+static_assert(RTREE_NODE_BYTES / sizeof(RTreeNode) == RTREE_INTERNAL_CAPACITY,
+              "RTREE_INTERNAL_CAPACITY out of sync with RTreeNode size");
 
 struct RTreeHeader {
-    uint32_t magic;          // 0x52545245  "RTRE"
-    uint32_t node_capacity;
+    uint32_t magic;              // 0x52545245  "RTRE"
+    uint32_t leaf_capacity;      // points per leaf node
     uint32_t height;
-    uint32_t _pad;
+    uint32_t internal_capacity;  // children per internal node
     uint64_t num_points;
     uint64_t num_nodes;
 };
@@ -508,25 +512,28 @@ void kway_merge_files(size_t run_count,
 // =========================================================
 
 size_t compute_str_slice_size(size_t total_points) {
-    size_t cap = RTREE_NODE_CAPACITY;
-    size_t num_leaves = (total_points + cap - 1) / cap;
+    size_t leaf_cap = RTREE_LEAF_CAPACITY;
+    size_t int_cap  = RTREE_INTERNAL_CAPACITY;
+    size_t num_leaves = (total_points + leaf_cap - 1) / leaf_cap;
     size_t num_slices = (size_t)std::ceil(std::sqrt((double)num_leaves));
 
-    // Leaves per slice, rounded UP to a multiple of `cap` so that
+    // Leaves per slice, rounded UP to a multiple of `int_cap` so that
     // level-1 internal node boundaries coincide with slice boundaries.
     // Without this, an internal node can straddle two slices whose
     // Y-sort domains are in different X-ranges, producing spatially
     // disjoint MBRs among its children.
     size_t leaves_per_slice = (num_leaves + num_slices - 1) / num_slices;
-    leaves_per_slice = ((leaves_per_slice + cap - 1) / cap) * cap;
+    leaves_per_slice = ((leaves_per_slice + int_cap - 1) / int_cap) * int_cap;
 
-    size_t slice_points = leaves_per_slice * cap;
+    size_t slice_points = leaves_per_slice * leaf_cap;
 
-    // Cap at GPU sort capacity, keeping cap² alignment.
-    size_t cap2 = cap * cap;
-    size_t max_slice = (STR_MAX_SLICE / cap2) * cap2;
-    if (max_slice < cap2) max_slice = cap2;
-
+    // Cap at GPU sort capacity, keeping leaf_cap × int_cap alignment.
+    size_t align = leaf_cap * int_cap;
+    size_t max_slice = (STR_MAX_SLICE / align) * align;
+    if (max_slice < align) {
+        std::cout << "Warning: STR_MAX_SLICE too small for leaf/internal node alignment\n";
+        max_slice = align;
+    }
     return std::min(slice_points, max_slice);
 }
 
@@ -535,11 +542,13 @@ size_t compute_str_slice_size(size_t total_points) {
 // No data access needed — purely structural computation.
 // =========================================================
 
-size_t precompute_num_nodes(size_t total_points, size_t capacity) {
-    size_t level = (total_points + capacity - 1) / capacity;  // leaves
+size_t precompute_num_nodes(size_t total_points,
+                           size_t leaf_cap,
+                           size_t internal_cap) {
+    size_t level = (total_points + leaf_cap - 1) / leaf_cap;  // leaves
     size_t total = level;
     while (level > 1) {
-        level = (level + capacity - 1) / capacity;
+        level = (level + internal_cap - 1) / internal_cap;
         total += level;
     }
     return total;
@@ -552,18 +561,18 @@ size_t precompute_num_nodes(size_t total_points, size_t capacity) {
 
 void build_internal_levels(std::vector<RTreeNode>& nodes,
                            size_t num_leaves,
-                           size_t capacity,
+                           size_t internal_cap,
                            uint32_t& height_out) {
     height_out = 1;
     size_t level_start = 0;
     size_t level_count = num_leaves;
 
     while (level_count > 1) {
-        size_t next_count = (level_count + capacity - 1) / capacity;
+        size_t next_count = (level_count + internal_cap - 1) / internal_cap;
 
         for (size_t i = 0; i < next_count; i++) {
-            size_t s   = level_start + i * capacity;
-            size_t cnt = std::min(capacity, level_count - i * capacity);
+            size_t s   = level_start + i * internal_cap;
+            size_t cnt = std::min(internal_cap, level_count - i * internal_cap);
 
             MBR m{INFINITY, INFINITY, -INFINITY, -INFINITY};
             for (size_t j = 0; j < cnt; j++) {
@@ -593,23 +602,24 @@ void build_internal_levels(std::vector<RTreeNode>& nodes,
 //
 // Points must already be in STR order (sorted by X globally,
 // then by Y within each vertical slice).  Consecutive groups
-// of RTREE_NODE_CAPACITY points form leaf nodes.  Internal
-// levels are built by grouping child MBRs.
+// of leaf_cap points form leaf nodes.  Internal levels are
+// built by grouping child nodes in batches of internal_cap.
 // =========================================================
 
 // --- Build from in-memory point array ---
 std::vector<RTreeNode> build_rtree(const Point* points,
                                    size_t num_points,
-                                   size_t capacity,
+                                   size_t leaf_cap,
+                                   size_t internal_cap,
                                    uint32_t& height_out) {
     std::vector<RTreeNode> nodes;
-    size_t num_leaves = (num_points + capacity - 1) / capacity;
+    size_t num_leaves = (num_points + leaf_cap - 1) / leaf_cap;
     nodes.reserve(num_leaves * 2);  // rough upper bound
 
     // Leaf level
     for (size_t i = 0; i < num_leaves; i++) {
-        size_t start = i * capacity;
-        size_t cnt   = std::min(capacity, num_points - start);
+        size_t start = i * leaf_cap;
+        size_t cnt   = std::min(leaf_cap, num_points - start);
 
         MBR m{INFINITY, INFINITY, -INFINITY, -INFINITY};
         for (size_t j = 0; j < cnt; j++) {
@@ -634,11 +644,11 @@ std::vector<RTreeNode> build_rtree(const Point* points,
     size_t level_count = num_leaves;
 
     while (level_count > 1) {
-        size_t next_count = (level_count + capacity - 1) / capacity;
+        size_t next_count = (level_count + internal_cap - 1) / internal_cap;
 
         for (size_t i = 0; i < next_count; i++) {
-            size_t s   = level_start + i * capacity;
-            size_t cnt = std::min(capacity, level_count - i * capacity);
+            size_t s   = level_start + i * internal_cap;
+            size_t cnt = std::min(internal_cap, level_count - i * internal_cap);
 
             MBR m{INFINITY, INFINITY, -INFINITY, -INFINITY};
             for (size_t j = 0; j < cnt; j++) {
@@ -684,11 +694,12 @@ void write_rtree_file(const std::string& path,
                       const Point* points,
                       size_t num_points) {
     RTreeHeader hdr{};
-    hdr.magic         = 0x52545245;  // "RTRE"
-    hdr.node_capacity = (uint32_t)RTREE_NODE_CAPACITY;
-    hdr.height        = height;
-    hdr.num_points    = num_points;
-    hdr.num_nodes     = nodes.size();
+    hdr.magic             = 0x52545245;  // "RTRE"
+    hdr.leaf_capacity     = (uint32_t)RTREE_LEAF_CAPACITY;
+    hdr.height            = height;
+    hdr.internal_capacity = (uint32_t)RTREE_INTERNAL_CAPACITY;
+    hdr.num_points        = num_points;
+    hdr.num_nodes         = nodes.size();
 
     std::ofstream out(path, std::ios::binary);
     out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
@@ -806,7 +817,9 @@ void external_str_inmemory(const std::string& input,
     auto t_tree0 = Clock::now();
     uint32_t height;
     std::vector<RTreeNode> nodes = build_rtree(data.data(), total_points,
-                                               RTREE_NODE_CAPACITY, height);
+                                               RTREE_LEAF_CAPACITY,
+                                               RTREE_INTERNAL_CAPACITY,
+                                               height);
     auto t_tree1 = Clock::now();
     double tree_ms = Ms(t_tree1 - t_tree0).count();
 
@@ -816,7 +829,7 @@ void external_str_inmemory(const std::string& input,
               << "  Nodes:       " << nodes.size() << "\n"
               << "  Height:      " << height << "\n"
               << "  Leaf nodes:  "
-              << ((total_points + RTREE_NODE_CAPACITY - 1) / RTREE_NODE_CAPACITY)
+              << ((total_points + RTREE_LEAF_CAPACITY - 1) / RTREE_LEAF_CAPACITY)
               << "\n";
 
     // ==========================================================
@@ -886,10 +899,7 @@ void external_str_disk(const std::string& input,
     std::cout << "\n*** DISK PATH (dataset exceeds RAM budget) ***\n";
 
     size_t slice = compute_str_slice_size(total_points);
-    // compute_str_slice_size already returns a cap²-aligned value,
-    // but enforce cap alignment as a safety net.
-    slice = std::max((slice / RTREE_NODE_CAPACITY) * RTREE_NODE_CAPACITY,
-                     RTREE_NODE_CAPACITY);
+
     std::cout << "STR slice size:     " << slice << " points ("
               << slice * sizeof(Point) / (1024.0*1024.0) << " MB)\n";
 
@@ -933,8 +943,10 @@ void external_str_disk(const std::string& input,
     auto phase2_start = Clock::now();
 
     // Pre-compute R-tree layout (purely structural, no data needed)
-    size_t num_nodes   = precompute_num_nodes(total_points, RTREE_NODE_CAPACITY);
-    size_t num_leaves  = (total_points + RTREE_NODE_CAPACITY - 1) / RTREE_NODE_CAPACITY;
+    size_t num_nodes   = precompute_num_nodes(total_points,
+                                               RTREE_LEAF_CAPACITY,
+                                               RTREE_INTERNAL_CAPACITY);
+    size_t num_leaves  = (total_points + RTREE_LEAF_CAPACITY - 1) / RTREE_LEAF_CAPACITY;
     size_t points_offset = sizeof(RTreeHeader) + num_nodes * sizeof(RTreeNode);
 
     std::cout << "  Pre-computed: " << num_nodes << " total nodes, "
@@ -1023,7 +1035,7 @@ void external_str_disk(const std::string& input,
 
             // 4) Compute leaf MBRs for the just-sorted slice (data is cache-hot)
             {
-                size_t cap = RTREE_NODE_CAPACITY;
+                size_t cap = RTREE_LEAF_CAPACITY;
                 size_t nleaves = (sort_n + cap - 1) / cap;
                 for (size_t li = 0; li < nleaves; li++) {
                     size_t start = li * cap;
@@ -1098,7 +1110,7 @@ void external_str_disk(const std::string& input,
     auto t_tree0 = Clock::now();
     uint32_t height;
     assert(nodes.size() == num_leaves);
-    build_internal_levels(nodes, num_leaves, RTREE_NODE_CAPACITY, height);
+    build_internal_levels(nodes, num_leaves, RTREE_INTERNAL_CAPACITY, height);
     assert(nodes.size() == num_nodes);
     auto t_tree1 = Clock::now();
     double tree_ms = Ms(t_tree1 - t_tree0).count();
@@ -1108,11 +1120,12 @@ void external_str_disk(const std::string& input,
     auto t_hdr0 = Clock::now();
     {
         RTreeHeader hdr{};
-        hdr.magic         = 0x52545245;  // "RTRE"
-        hdr.node_capacity = (uint32_t)RTREE_NODE_CAPACITY;
-        hdr.height        = height;
-        hdr.num_points    = total_points;
-        hdr.num_nodes     = nodes.size();
+        hdr.magic             = 0x52545245;  // "RTRE"
+        hdr.leaf_capacity     = (uint32_t)RTREE_LEAF_CAPACITY;
+        hdr.height            = height;
+        hdr.internal_capacity = (uint32_t)RTREE_INTERNAL_CAPACITY;
+        hdr.num_points        = total_points;
+        hdr.num_nodes         = nodes.size();
 
         std::fstream fout(output, std::ios::binary | std::ios::in | std::ios::out);
         fout.seekp(0);
@@ -1181,7 +1194,9 @@ void external_str(const std::string& input,
     std::cout << "USABLE_RAM_BYTES:   " << USABLE_RAM_BYTES / (1024*1024)
               << " MB" << std::endl;
     std::cout << "SORT_CHUNK_POINTS:  " << SORT_CHUNK_POINTS << std::endl;
-    std::cout << "RTREE_NODE_CAPACITY:" << RTREE_NODE_CAPACITY << std::endl;
+    std::cout << "RTREE_NODE_BYTES:   " << RTREE_NODE_BYTES << std::endl;
+    std::cout << "LEAF_CAPACITY:      " << RTREE_LEAF_CAPACITY << std::endl;
+    std::cout << "INTERNAL_CAPACITY:  " << RTREE_INTERNAL_CAPACITY << std::endl;
     std::cout << "STR slice size:     " << compute_str_slice_size(total_points)
               << std::endl;
     std::cout << "Dataset size:       " << file_size / (1024*1024)

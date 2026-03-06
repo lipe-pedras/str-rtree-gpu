@@ -44,7 +44,7 @@ constexpr size_t USABLE_GPU_BYTES = 3161037209ULL;
 //  16 GB RAM  ->  use 11 GB  ->  11811160064ULL
 //  32 GB RAM  ->  use 24 GB  ->  25769803776ULL
 //  64 GB RAM  ->  use 48 GB  ->  51539607552ULL
-constexpr size_t USABLE_RAM_BYTES = 1ULL;  // 11 GB
+constexpr size_t USABLE_RAM_BYTES = 1ULL;
 
 // =========================================================
 // Chunk Sizes (derived from GPU budget)
@@ -59,16 +59,20 @@ constexpr size_t SORT_CHUNK_POINTS = USABLE_GPU_BYTES / 2 / 8;  // sizeof(Point)
 // R-Tree / STR Parameters
 // =========================================================
 
-// Maximum entries per R-Tree node (leaf or internal).
-// Leaf nodes hold up to this many points.
-// Internal nodes hold up to this many child MBRs.
-// Typical values: 50–256.  Larger → shallower tree, larger nodes.
-constexpr size_t RTREE_NODE_CAPACITY = 128;
+// Maximum byte budget per R-Tree node.
+// Leaf nodes store up to RTREE_NODE_BYTES / sizeof(Point) points.
+// Internal nodes store up to RTREE_NODE_BYTES / sizeof(RTreeNode) children.
+constexpr size_t RTREE_NODE_BYTES = 4096;
+
+// Derived capacities (sizeof(Point) == 8, sizeof(RTreeNode) == 32).
+// Verified by static_asserts in external_str_cuda.cu.
+constexpr size_t RTREE_LEAF_CAPACITY     = RTREE_NODE_BYTES / 8;   // points per leaf
+constexpr size_t RTREE_INTERNAL_CAPACITY = RTREE_NODE_BYTES / 32;  // children per internal node
 
 // Maximum points per vertical slice for STR Y-sorting.
 // Capped at SORT_CHUNK_POINTS (must fit in one GPU sort call).
 // The actual slice size is computed at runtime based on
-// RTREE_NODE_CAPACITY and the dataset size (see compute_str_slice_size).
+// RTREE_LEAF_CAPACITY and the dataset size (see compute_str_slice_size).
 constexpr size_t STR_MAX_SLICE = SORT_CHUNK_POINTS;
 
 #endif // CONSTANTS_H
