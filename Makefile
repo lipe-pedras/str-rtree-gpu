@@ -59,6 +59,9 @@ clean-tmp:
 clean-data:
 	find $(DATA_DIR) -name "*.bin" | xargs rm -f
 
+view:
+	python3 src/rtree_viewer.py data/rtree.bin
+
 # ----------------------------------------------------------------
 # Help
 # ----------------------------------------------------------------
@@ -72,6 +75,7 @@ help:
 	@echo "  make clean           Remove compiled binaries"
 	@echo "  make clean-tmp       Remove intermediate files in tmp/"
 	@echo "  make clean-data      Remove dataset files in data/"
+	@echo "  make view            Visualize the R-Tree structure (requires matplotlib)"
 	@echo ""
 	@echo "Usage:"
 	@echo "  ./bin/gpu_info"

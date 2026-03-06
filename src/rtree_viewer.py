@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Interactive R-Tree Viewer
-=========================
+Interactive R-Tree Viewer  (out-of-core / larger-than-RAM)
+==========================================================
 Reads the binary R-tree file produced by external_str_cuda and renders
 points + MBRs in a matplotlib GUI.
+
+The file is memory-mapped with numpy.memmap so that only the pages
+currently being viewed are loaded into physical RAM by the OS.  This
+allows inspection of R-trees built over datasets far larger than
+available memory.
 
 Usage:
     python rtree_viewer.py data/rtree.bin
@@ -29,50 +34,58 @@ import matplotlib.colors as mcolors
 
 # ─── Binary format ────────────────────────────────────────
 
-HEADER_FMT = "<IIIIqq"          # magic, cap, height, pad, num_points(i64), num_nodes(i64) — but file uses u64
 HEADER_SIZE = 32
-NODE_FMT   = "<ffffQII"         # min_x, min_y, max_x, max_y, first_child, num_children, is_leaf
-NODE_SIZE  = 32
-POINT_FMT  = "<ff"
-POINT_SIZE = 8
+NODE_SIZE   = 32
+POINT_SIZE  = 8
+
+NODE_DTYPE = np.dtype([
+    ("min_x", "<f4"), ("min_y", "<f4"),
+    ("max_x", "<f4"), ("max_y", "<f4"),
+    ("first_child", "<u8"),
+    ("num_children", "<u4"),
+    ("is_leaf", "<u4"),
+])
+
+POINT_DTYPE = np.dtype([("x", "<f4"), ("y", "<f4")])
 
 
-def read_header(f):
-    buf = f.read(HEADER_SIZE)
-    magic, cap, height, _pad = struct.unpack_from("<IIII", buf, 0)
+def read_header(path):
+    """Read the 32-byte header without loading anything else."""
+    with open(path, "rb") as f:
+        buf = f.read(HEADER_SIZE)
+    magic, leaf_cap, height, internal_cap = struct.unpack_from("<IIII", buf, 0)
     num_points, num_nodes = struct.unpack_from("<QQ", buf, 16)
     assert magic == 0x52545245, f"Bad magic: {magic:#x}"
     return {
         "magic": magic,
-        "node_capacity": cap,
+        "leaf_capacity": leaf_cap,
+        "internal_capacity": internal_cap,
         "height": height,
         "num_points": num_points,
         "num_nodes": num_nodes,
     }
 
 
-def read_nodes(f, n):
-    """Return structured numpy array of nodes."""
-    dt = np.dtype([
-        ("min_x", "<f4"), ("min_y", "<f4"),
-        ("max_x", "<f4"), ("max_y", "<f4"),
-        ("first_child", "<u8"),
-        ("num_children", "<u4"),
-        ("is_leaf", "<u4"),
-    ])
-    return np.frombuffer(f.read(n * NODE_SIZE), dtype=dt)
+def mmap_rtree(path):
+    """Return (header, nodes_memmap, points_memmap).
 
+    Both arrays are read-only memory-mapped views into the file.
+    The OS will page in only the regions that are actually accessed,
+    so RAM usage stays proportional to the *visible* portion of the tree.
+    """
+    hdr = read_header(path)
 
-def read_points(f, n):
-    dt = np.dtype([("x", "<f4"), ("y", "<f4")])
-    return np.frombuffer(f.read(n * POINT_SIZE), dtype=dt)
+    nodes_offset = HEADER_SIZE
+    points_offset = nodes_offset + hdr["num_nodes"] * NODE_SIZE
 
+    nodes = np.memmap(path, dtype=NODE_DTYPE, mode="r",
+                      offset=nodes_offset,
+                      shape=(hdr["num_nodes"],))
 
-def load_rtree(path):
-    with open(path, "rb") as f:
-        hdr = read_header(f)
-        nodes = read_nodes(f, hdr["num_nodes"])
-        points = read_points(f, hdr["num_points"])
+    points = np.memmap(path, dtype=POINT_DTYPE, mode="r",
+                       offset=points_offset,
+                       shape=(hdr["num_points"],))
+
     return hdr, nodes, points
 
 
@@ -87,18 +100,16 @@ LEVEL_COLORS = [
 
 class RTreeViewer:
     def __init__(self, path):
-        self.hdr, self.nodes, self.points = load_rtree(path)
+        # Memory-map instead of loading the whole file
+        self.hdr, self.nodes, self.points = mmap_rtree(path)
+
         self.root_idx = self.hdr["num_nodes"] - 1
-        self.capacity = self.hdr["node_capacity"]
+        self.leaf_capacity = self.hdr["leaf_capacity"]
+        self.internal_capacity = self.hdr["internal_capacity"]
 
         # Navigation stack: each entry is a list of node indices to display
-        root_node = self.nodes[self.root_idx]
         self.stack = []  # history of parent views
         self.current_indices = [self.root_idx]  # start showing the root
-
-        # Precompute point arrays for fast scatter
-        self.px = self.points["x"]
-        self.py = self.points["y"]
 
         # Set up figure
         self.fig, self.ax = plt.subplots(figsize=(12, 10))
@@ -145,17 +156,23 @@ class RTreeViewer:
                              linewidth=1.5, alpha=0.85)
         ax.add_collection(pc)
 
-        # Draw points if leaves
+        # Draw points if leaves — only touch the relevant slices of
+        # the memmap so the OS only pages in those regions.
         if all_leaf:
-            # Gather point indices across all displayed leaf nodes
-            pt_mask = np.zeros(len(self.px), dtype=bool)
+            chunks_x = []
+            chunks_y = []
             for idx in indices:
                 nd = n[idx]
                 s = int(nd["first_child"])
                 e = s + int(nd["num_children"])
-                pt_mask[s:e] = True
-            ax.scatter(self.px[pt_mask], self.py[pt_mask],
-                       s=0.3, c="black", alpha=0.4, rasterized=True)
+                chunk = self.points[s:e]      # memmap slice → pages in only this range
+                chunks_x.append(chunk["x"])
+                chunks_y.append(chunk["y"])
+            if chunks_x:
+                vis_x = np.concatenate(chunks_x)
+                vis_y = np.concatenate(chunks_y)
+                ax.scatter(vis_x, vis_y,
+                           s=0.3, c="black", alpha=0.4, rasterized=True)
 
         # If we're showing children of a parent, also draw the parent MBR
         # in a lighter shade for context
@@ -189,7 +206,7 @@ class RTreeViewer:
         node_type = "leaf" if all_leaf else "internal"
         ax.set_title(
             f"R-Tree  |  {level_name}  |  {len(indices)} {node_type} node(s)  |  "
-            f"height={self.hdr['height']}  cap={self.capacity}  "
+            f"height={self.hdr['height']}  leaf_cap={self.leaf_capacity}  int_cap={self.internal_capacity}  "
             f"nodes={self.hdr['num_nodes']}  points={self.hdr['num_points']}\n"
             f"Left-click MBR → drill down  |  Right-click → go back  |  "
             f"'r' → reset  |  'q' → quit",
