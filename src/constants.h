@@ -44,7 +44,7 @@ constexpr size_t USABLE_GPU_BYTES = 3161037209ULL;
 //  16 GB RAM  ->  use 11 GB  ->  11811160064ULL
 //  32 GB RAM  ->  use 24 GB  ->  25769803776ULL
 //  64 GB RAM  ->  use 48 GB  ->  51539607552ULL
-constexpr size_t USABLE_RAM_BYTES = 1ULL;
+constexpr size_t USABLE_RAM_BYTES = 5368709120ULL;
 
 // =========================================================
 // Chunk Sizes (derived from GPU budget)
