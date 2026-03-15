@@ -21,7 +21,7 @@ TMP_DIR  := tmp
 
 NVCC      := nvcc
 CXX       := g++
-NVCCFLAGS := -O3 -std=c++17
+NVCCFLAGS := -O3 -std=c++17 -arch=sm_86
 CXXFLAGS  := -O3 -std=c++17
 
 # ----------------------------------------------------------------
