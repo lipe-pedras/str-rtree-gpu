@@ -28,13 +28,19 @@ CXXFLAGS  := -O3 -std=c++17
 # Default target
 # ----------------------------------------------------------------
 .PHONY: all
-all: $(BIN_DIR)/external_str $(BIN_DIR)/gen_points $(BIN_DIR)/gpu_info
+all: $(BIN_DIR)/external_str $(BIN_DIR)/external_str_cpu $(BIN_DIR)/rtree_query $(BIN_DIR)/gen_points $(BIN_DIR)/gpu_info
 
 # ----------------------------------------------------------------
 # Binaries
 # ----------------------------------------------------------------
 $(BIN_DIR)/external_str: $(SRC_DIR)/external_str_cuda.cu $(SRC_DIR)/constants.h
 	$(NVCC) $(NVCCFLAGS) $< -o $@ 
+
+$(BIN_DIR)/external_str_cpu: $(SRC_DIR)/external_str_cpu.cpp $(SRC_DIR)/constants.h
+	$(CXX) $(CXXFLAGS) $< -o $@ -lpthread
+
+$(BIN_DIR)/rtree_query: $(SRC_DIR)/rtree_query.cpp $(SRC_DIR)/constants.h
+	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BIN_DIR)/gen_points: $(SRC_DIR)/gen_points.cpp
 	$(CXX) $(CXXFLAGS) $< -o $@
@@ -49,7 +55,7 @@ $(BIN_DIR)/gpu_info: $(SRC_DIR)/gpu_info.cu
 
 # Remove compiled binaries (keeps directories)
 clean:
-	rm -f $(BIN_DIR)/external_str $(BIN_DIR)/gen_points $(BIN_DIR)/gpu_info
+	rm -f $(BIN_DIR)/external_str $(BIN_DIR)/external_str_cpu $(BIN_DIR)/rtree_query $(BIN_DIR)/gen_points $(BIN_DIR)/gpu_info
 
 # Remove intermediate sort files left in tmp/
 clean-tmp:

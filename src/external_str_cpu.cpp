@@ -1,9 +1,9 @@
-// external_str_cuda.cu
-// STR (Sort-Tile-Recursive) R-Tree bulk-loading with GPU pipeline
-// Supports datasets larger than VRAM via dual-thread external sorting
-// with optional RAM caching of sorted runs.
+// external_str_cpu.cpp
+// STR (Sort-Tile-Recursive) R-Tree bulk-loading — CPU-only version
+// Drop-in replacement for external_str_cuda.cu for benchmarking
+// without GPU — all sorting done with std::sort on the CPU.
 //
-// Output file format:
+// Output file format is identical:
 //   [RTreeHeader  – 32 bytes]
 //   [RTreeNode[]  – num_nodes × 32 bytes]
 //   [Point[]      – num_points × 8 bytes]
@@ -12,11 +12,7 @@
 // Leaf nodes reference contiguous ranges of points.
 // Internal nodes reference contiguous ranges of child nodes.
 //
-// Compile: nvcc -O3 -std=c++17 external_str_cuda.cu -o external_str -lpthread
-
-#include <cuda_runtime.h>
-#include <thrust/device_ptr.h>
-#include <thrust/sort.h>
+// Compile: g++ -O3 -std=c++17 -pthread external_str_cpu.cpp -o external_str_cpu
 
 #include <iostream>
 #include <iomanip>
@@ -44,15 +40,10 @@ using Ms    = std::chrono::duration<double, std::milli>;
 struct TimingStats {
     double disk_read_ms   = 0;
     double disk_write_ms  = 0;
-    double h2d_ms         = 0;
-    double d2h_ms         = 0;
-    double gpu_compute_ms = 0;
-    double gpu_alloc_ms   = 0;
+    double cpu_sort_ms    = 0;
 
     size_t bytes_read     = 0;
     size_t bytes_written  = 0;
-    size_t bytes_h2d      = 0;
-    size_t bytes_d2h      = 0;
 
     void print(const char* phase) const {
         auto bw = [](size_t bytes, double ms) -> double {
@@ -66,30 +57,17 @@ struct TimingStats {
                   << "  Disk write:    " << disk_write_ms  << " ms  ("
                   << bw(bytes_written, disk_write_ms) << " MB/s, "
                   << bytes_written / (1024.0*1024.0) << " MB)\n"
-                  << "  GPU alloc:     " << gpu_alloc_ms   << " ms\n"
-                  << "  H2D transfer:  " << h2d_ms         << " ms  ("
-                  << bw(bytes_h2d, h2d_ms) << " MB/s, "
-                  << bytes_h2d / (1024.0*1024.0) << " MB)\n"
-                  << "  GPU compute:   " << gpu_compute_ms << " ms\n"
-                  << "  D2H transfer:  " << d2h_ms         << " ms  ("
-                  << bw(bytes_d2h, d2h_ms) << " MB/s, "
-                  << bytes_d2h / (1024.0*1024.0) << " MB)\n"
+                  << "  CPU sort:      " << cpu_sort_ms << " ms\n"
                   << "  TOTAL:         "
-                  << (disk_read_ms + disk_write_ms + gpu_alloc_ms
-                      + h2d_ms + gpu_compute_ms + d2h_ms) << " ms\n";
+                  << (disk_read_ms + disk_write_ms + cpu_sort_ms) << " ms\n";
     }
 
     TimingStats& operator+=(const TimingStats& o) {
         disk_read_ms   += o.disk_read_ms;
         disk_write_ms  += o.disk_write_ms;
-        h2d_ms         += o.h2d_ms;
-        d2h_ms         += o.d2h_ms;
-        gpu_compute_ms += o.gpu_compute_ms;
-        gpu_alloc_ms   += o.gpu_alloc_ms;
+        cpu_sort_ms    += o.cpu_sort_ms;
         bytes_read     += o.bytes_read;
         bytes_written  += o.bytes_written;
-        bytes_h2d      += o.bytes_h2d;
-        bytes_d2h      += o.bytes_d2h;
         return *this;
     }
 };
@@ -145,59 +123,29 @@ static_assert(sizeof(RTreeHeader) == 32);
 // =========================================================
 
 struct CompareX {
-    __host__ __device__
     bool operator()(const Point& a, const Point& b) const {
         return a.x < b.x;
     }
 };
 
 struct CompareY {
-    __host__ __device__
     bool operator()(const Point& a, const Point& b) const {
         return a.y < b.y;
     }
 };
 
 // =========================================================
-// GPU SORT (chunk local)  — with detailed timing
+// CPU SORT (chunk local) — with detailed timing
 // =========================================================
 
-void gpu_sort(Point* host_data, size_t n, bool by_x) {
-    size_t bytes = n * sizeof(Point);
-    Point* d_ptr_raw = nullptr;
-
-    // --- GPU alloc ---
+void cpu_sort(Point* data, size_t n, bool by_x) {
     auto t0 = Clock::now();
-    cudaMalloc(&d_ptr_raw, bytes);
-    cudaDeviceSynchronize();
-    auto t1 = Clock::now();
-    g_stats.gpu_alloc_ms += Ms(t1 - t0).count();
-
-    // --- H2D ---
-    cudaMemcpy(d_ptr_raw, host_data, bytes, cudaMemcpyHostToDevice);
-    cudaDeviceSynchronize();
-    auto t2 = Clock::now();
-    g_stats.h2d_ms    += Ms(t2 - t1).count();
-    g_stats.bytes_h2d += bytes;
-
-    // --- GPU sort ---
-    thrust::device_ptr<Point> d(d_ptr_raw);
     if (by_x)
-        thrust::sort(d, d + n, CompareX());
+        std::sort(data, data + n, CompareX());
     else
-        thrust::sort(d, d + n, CompareY());
-    cudaDeviceSynchronize();
-    auto t3 = Clock::now();
-    g_stats.gpu_compute_ms += Ms(t3 - t2).count();
-
-    // --- D2H ---
-    cudaMemcpy(host_data, d_ptr_raw, bytes, cudaMemcpyDeviceToHost);
-    cudaDeviceSynchronize();
-    auto t4 = Clock::now();
-    g_stats.d2h_ms    += Ms(t4 - t3).count();
-    g_stats.bytes_d2h += bytes;
-
-    cudaFree(d_ptr_raw);
+        std::sort(data, data + n, CompareY());
+    auto t1 = Clock::now();
+    g_stats.cpu_sort_ms += Ms(t1 - t0).count();
 }
 
 // =========================================================
@@ -213,7 +161,7 @@ struct CachedRun {
 // =========================================================
 // Generate X-sorted runs with dual-thread pipeline.
 //
-// Main thread:  GPU sort
+// Main thread:  CPU sort
 // I/O thread:   serialized write-then-read (no concurrent disk ops)
 //
 // Runs that fit within ram_budget are cached in host RAM;
@@ -226,10 +174,10 @@ void generate_runs_cached(const std::string& input,
                           size_t& ram_budget) {
     size_t chunk_bytes = points_per_chunk * sizeof(Point);
 
-    // 2 pinned host buffers for dual-thread pipeline
-    Point* bufs[2];
-    cudaMallocHost(&bufs[0], chunk_bytes);
-    cudaMallocHost(&bufs[1], chunk_bytes);
+    // 2 host buffers for dual-thread pipeline
+    std::vector<Point> buf0(points_per_chunk);
+    std::vector<Point> buf1(points_per_chunk);
+    Point* bufs[2] = { buf0.data(), buf1.data() };
 
     std::ifstream in(input, std::ios::binary);
 
@@ -242,8 +190,6 @@ void generate_runs_cached(const std::string& input,
     g_stats.bytes_read   += n0 * sizeof(Point);
 
     if (n0 == 0) {
-        cudaFreeHost(bufs[0]);
-        cudaFreeHost(bufs[1]);
         in.close();
         return;
     }
@@ -297,8 +243,8 @@ void generate_runs_cached(const std::string& input,
                 });
         }
 
-        // --- Main thread: GPU sort ---
-        gpu_sort(bufs[sort_buf], sort_n, true);
+        // --- Main thread: CPU sort ---
+        cpu_sort(bufs[sort_buf], sort_n, true);
 
         // Decide: cache in RAM or defer disk write
         size_t run_bytes = sort_n * sizeof(Point);
@@ -347,8 +293,6 @@ void generate_runs_cached(const std::string& input,
     }
 
     in.close();
-    cudaFreeHost(bufs[0]);
-    cudaFreeHost(bufs[1]);
 }
 
 // =========================================================
@@ -561,21 +505,15 @@ size_t compute_str_slice_size(size_t total_points) {
     size_t num_leaves = (total_points + leaf_cap - 1) / leaf_cap;
     size_t num_slices = (size_t)std::ceil(std::sqrt((double)num_leaves));
 
-    // Leaves per slice, rounded UP to a multiple of `leaf_cap` so that
-    // leaf boundaries align with slice boundaries (each leaf is a full
-    // group of points).  No need to align to `int_cap` because
-    // sort_nodes_str() re-sorts every level before grouping into parents.
     size_t leaves_per_slice = (num_leaves + num_slices - 1) / num_slices;
-
     size_t slice_points = leaves_per_slice * leaf_cap;
 
-    // Cap at GPU sort capacity.
+    // Cap at SORT_CHUNK_POINTS (same budget, but now CPU RAM)
     return std::min(slice_points, STR_MAX_SLICE);
 }
 
 // =========================================================
 // Pre-compute total number of R-tree nodes.
-// No data access needed — purely structural computation.
 // =========================================================
 
 size_t precompute_num_nodes(size_t total_points,
@@ -592,38 +530,30 @@ size_t precompute_num_nodes(size_t total_points,
 
 // =========================================================
 // STR sort a contiguous range of RTreeNode entries.
-// Sorts by MBR center X globally, then by MBR center Y
-// within each vertical slice.  Slice sizes are aligned to
-// `group_cap` so that parent-node boundaries coincide with
-// slice boundaries.
 // =========================================================
 
 void sort_nodes_str(std::vector<RTreeNode>& nodes,
                     size_t level_start,
                     size_t level_count,
                     size_t group_cap) {
-    if (level_count <= group_cap) return;  // single parent — nothing to tile
+    if (level_count <= group_cap) return;
 
     auto begin = nodes.begin() + level_start;
 
-    // Number of parent groups that will be formed from this level
     size_t num_groups = (level_count + group_cap - 1) / group_cap;
     size_t num_slices = (size_t)std::ceil(std::sqrt((double)num_groups));
 
-    // Nodes per slice, rounded UP to a multiple of group_cap so that
-    // parent-node boundaries never straddle two slices.
     size_t nodes_per_slice = (level_count + num_slices - 1) / num_slices;
     nodes_per_slice = ((nodes_per_slice + group_cap - 1) / group_cap) * group_cap;
 
-    // 1) Sort entire level by MBR center X  (min_x+max_x is monotonically
-    //    equivalent to (min_x+max_x)/2, so we skip the division).
+    // 1) Sort entire level by MBR center X
     std::sort(begin, begin + level_count,
               [](const RTreeNode& a, const RTreeNode& b) {
                   return (a.mbr.min_x + a.mbr.max_x) <
                          (b.mbr.min_x + b.mbr.max_x);
               });
 
-    // 2) Within each vertical slice, sort by MBR center Y.
+    // 2) Within each vertical slice, sort by MBR center Y
     for (size_t off = 0; off < level_count; off += nodes_per_slice) {
         size_t cnt = std::min(nodes_per_slice, level_count - off);
         std::sort(begin + off, begin + off + cnt,
@@ -636,8 +566,6 @@ void sort_nodes_str(std::vector<RTreeNode>& nodes,
 
 // =========================================================
 // Build internal R-tree levels from a vector of leaf nodes.
-// Appends internal nodes to `nodes`. Sets height_out.
-// Each level is STR-sorted before grouping into parents.
 // =========================================================
 
 void build_internal_levels(std::vector<RTreeNode>& nodes,
@@ -649,7 +577,6 @@ void build_internal_levels(std::vector<RTreeNode>& nodes,
     size_t level_count = num_leaves;
 
     while (level_count > 1) {
-        // STR-sort this level before grouping into parents
         sort_nodes_str(nodes, level_start, level_count, internal_cap);
 
         size_t next_count = (level_count + internal_cap - 1) / internal_cap;
@@ -682,15 +609,12 @@ void build_internal_levels(std::vector<RTreeNode>& nodes,
 }
 
 // =========================================================
-// Unified STR R-Tree builder.
+// Unified STR R-Tree builder — CPU-only version.
 //
-// Single code path for all dataset sizes.  Uses USABLE_RAM_BYTES
-// as a budget to cache X-sorted runs in RAM when possible.
-//
-// Phase 1a: GPU X-sort chunks (dual-thread: GPU sort ‖ serial I/O)
+// Phase 1a: CPU X-sort chunks (dual-thread: CPU sort ‖ serial I/O)
 // Phase 1b: K-way merge (in-memory if all cached, disk otherwise)
-// Phase 2:  GPU Y-sort STR slices + leaf MBR computation
-//           (dual-thread: GPU sort ‖ serial I/O)
+// Phase 2:  CPU Y-sort STR slices + leaf MBR computation
+//           (dual-thread: CPU sort ‖ serial I/O)
 // Phase 3:  Build internal R-tree levels + write header
 // =========================================================
 
@@ -715,7 +639,7 @@ void external_str_build(const std::string& input,
     generate_runs_cached(input, SORT_CHUNK_POINTS, runs, ram_budget);
 
     TimingStats gen_stats = g_stats;
-    gen_stats.print("Phase 1a \u2014 Generate X-sorted runs");
+    gen_stats.print("Phase 1a — Generate X-sorted runs");
 
     size_t cached = 0, on_disk = 0;
     for (auto& r : runs) {
@@ -752,7 +676,7 @@ void external_str_build(const std::string& input,
     }
 
     TimingStats merge_stats = g_stats;
-    merge_stats.print("Phase 1b \u2014 Merge X-sorted runs");
+    merge_stats.print("Phase 1b — Merge X-sorted runs");
 
     auto phase1_end = Clock::now();
     std::cout << "  Merged data: "
@@ -763,7 +687,7 @@ void external_str_build(const std::string& input,
     // =====================================================
     // Phase 2: STR Y-sort slices + leaf MBRs + write output
     //
-    // Dual-thread: GPU sort ‖ serialized I/O
+    // Dual-thread: CPU sort ‖ serialized I/O
     // =====================================================
     g_stats = {};
     auto phase2_start = Clock::now();
@@ -785,10 +709,10 @@ void external_str_build(const std::string& input,
 
     size_t slice_bytes = slice * sizeof(Point);
 
-    // 2 pinned host buffers for dual-thread Y-sort pipeline
-    Point* sbufs[2];
-    cudaMallocHost(&sbufs[0], slice_bytes);
-    cudaMallocHost(&sbufs[1], slice_bytes);
+    // 2 host buffers for dual-thread Y-sort pipeline
+    std::vector<Point> sbuf0(slice);
+    std::vector<Point> sbuf1(slice);
+    Point* sbufs[2] = { sbuf0.data(), sbuf1.data() };
 
     size_t points_written = 0;
 
@@ -882,10 +806,10 @@ void external_str_build(const std::string& input,
                 });
         }
 
-        // --- Main thread: GPU sort current slice by Y ---
-        gpu_sort(sbufs[sort_buf], sort_n, false);
+        // --- Main thread: CPU sort current slice by Y ---
+        cpu_sort(sbufs[sort_buf], sort_n, false);
 
-        // Compute leaf MBRs (data is cache-hot after D2H)
+        // Compute leaf MBRs (data is cache-hot after sort)
         {
             size_t cap = RTREE_LEAF_CAPACITY;
             size_t nleaves = (sort_n + cap - 1) / cap;
@@ -946,9 +870,6 @@ void external_str_build(const std::string& input,
     if (in_file.is_open()) in_file.close();
     out_file.close();
 
-    cudaFreeHost(sbufs[0]);
-    cudaFreeHost(sbufs[1]);
-
     // Free X-sorted data
     sorted_mem.clear();
     sorted_mem.shrink_to_fit();
@@ -956,7 +877,7 @@ void external_str_build(const std::string& input,
         std::filesystem::remove(sorted_x);
 
     TimingStats tile_stats = g_stats;
-    tile_stats.print("Phase 2 \u2014 STR Y-sort + leaf MBRs + write");
+    tile_stats.print("Phase 2 — STR Y-sort + leaf MBRs + write");
     std::cout << "Phase 2 wall time: "
               << Ms(Clock::now() - phase2_start).count() << " ms\n";
 
@@ -1007,7 +928,7 @@ void external_str_build(const std::string& input,
     total_stats += gen_stats;
     total_stats += merge_stats;
     total_stats += tile_stats;
-    total_stats.print("GRAND TOTAL (I/O + GPU)");
+    total_stats.print("GRAND TOTAL (I/O + CPU)");
 
     size_t out_bytes = sizeof(RTreeHeader)
                      + nodes.size() * sizeof(RTreeNode)
@@ -1022,7 +943,7 @@ void external_str_build(const std::string& input,
               << "\nTotal wall-clock time: "
               << Ms(wall_end - wall_start).count() / 1000.0
               << " s\n"
-              << "STR R-Tree complete." << std::endl;
+              << "STR R-Tree complete (CPU-only)." << std::endl;
 }
 
 // =========================================================
@@ -1035,9 +956,8 @@ void external_str(const std::string& input,
     size_t file_size = std::filesystem::file_size(input);
     size_t total_points = file_size / sizeof(Point);
 
+    std::cout << "=== CPU-only STR R-Tree Builder ===" << std::endl;
     std::cout << "Total points:       " << total_points << std::endl;
-    std::cout << "USABLE_GPU_BYTES:   " << USABLE_GPU_BYTES / (1024*1024)
-              << " MB" << std::endl;
     std::cout << "USABLE_RAM_BYTES:   " << USABLE_RAM_BYTES / (1024*1024)
               << " MB" << std::endl;
     std::cout << "SORT_CHUNK_POINTS:  " << SORT_CHUNK_POINTS << std::endl;
@@ -1059,7 +979,7 @@ void external_str(const std::string& input,
 int main(int argc, char** argv) {
 
     if (argc < 3) {
-        std::cout << "Usage: ./external_str input.bin output.bin"
+        std::cout << "Usage: ./external_str_cpu input.bin output.bin"
                   << std::endl;
         return 0;
     }
