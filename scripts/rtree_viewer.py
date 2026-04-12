@@ -35,16 +35,32 @@ import matplotlib.colors as mcolors
 # ─── Binary format ────────────────────────────────────────
 
 HEADER_SIZE = 32
-NODE_SIZE   = 32
 POINT_SIZE  = 8
 
+# Must match constants.h
+RTREE_NODE_BYTES = 4096
+RTREE_NODE_CAPACITY = (RTREE_NODE_BYTES - 16) // 16  # 255
+
+# Node layout:
+#   uint64_t first_child          (8 bytes)
+#   MBR children_mbrs[255]        (255 × 16 = 4080 bytes)
+#   uint32_t num_children         (4 bytes)
+#   uint32_t is_leaf              (4 bytes)
+# Total = 8 + 4080 + 4 + 4 = 4096
+
+NODE_SIZE = RTREE_NODE_BYTES
+
+# We define a structured dtype that captures the key fields.
+# children_mbrs is stored as raw bytes so we can slice per-node.
 NODE_DTYPE = np.dtype([
-    ("min_x", "<f4"), ("min_y", "<f4"),
-    ("max_x", "<f4"), ("max_y", "<f4"),
     ("first_child", "<u8"),
+    ("children_mbrs_raw", f"({RTREE_NODE_CAPACITY * 4},)<f4"),  # 255 MBRs × 4 floats
     ("num_children", "<u4"),
     ("is_leaf", "<u4"),
 ])
+
+assert NODE_DTYPE.itemsize == NODE_SIZE, \
+    f"NODE_DTYPE size {NODE_DTYPE.itemsize} != {NODE_SIZE}"
 
 POINT_DTYPE = np.dtype([("x", "<f4"), ("y", "<f4")])
 
@@ -53,13 +69,12 @@ def read_header(path):
     """Read the 32-byte header without loading anything else."""
     with open(path, "rb") as f:
         buf = f.read(HEADER_SIZE)
-    magic, leaf_cap, height, internal_cap = struct.unpack_from("<IIII", buf, 0)
+    magic, node_cap, height, _reserved = struct.unpack_from("<IIII", buf, 0)
     num_points, num_nodes = struct.unpack_from("<QQ", buf, 16)
     assert magic == 0x52545245, f"Bad magic: {magic:#x}"
     return {
         "magic": magic,
-        "leaf_capacity": leaf_cap,
-        "internal_capacity": internal_cap,
+        "node_capacity": node_cap,
         "height": height,
         "num_points": num_points,
         "num_nodes": num_nodes,
@@ -89,6 +104,26 @@ def mmap_rtree(path):
     return hdr, nodes, points
 
 
+def get_children_mbrs(node):
+    """Extract (num_children, 4) array of MBR floats from a node record."""
+    nc = int(node["num_children"])
+    raw = node["children_mbrs_raw"]  # flat array of RTREE_NODE_CAPACITY*4 floats
+    mbrs = raw.reshape(RTREE_NODE_CAPACITY, 4)[:nc]
+    return mbrs  # shape (nc, 4): [min_x, min_y, max_x, max_y]
+
+
+def compute_node_mbr(node):
+    """Compute the overall MBR of a node as the union of its children_mbrs."""
+    mbrs = get_children_mbrs(node)
+    if len(mbrs) == 0:
+        return (0, 0, 0, 0)
+    min_x = float(mbrs[:, 0].min())
+    min_y = float(mbrs[:, 1].min())
+    max_x = float(mbrs[:, 2].max())
+    max_y = float(mbrs[:, 3].max())
+    return (min_x, min_y, max_x, max_y)
+
+
 # ─── Viewer ───────────────────────────────────────────────
 
 # Color palette for tree levels (deepest → shallowest)
@@ -104,8 +139,7 @@ class RTreeViewer:
         self.hdr, self.nodes, self.points = mmap_rtree(path)
 
         self.root_idx = self.hdr["num_nodes"] - 1
-        self.leaf_capacity = self.hdr["leaf_capacity"]
-        self.internal_capacity = self.hdr["internal_capacity"]
+        self.node_capacity = self.hdr["node_capacity"]
 
         # Navigation stack: each entry is a list of node indices to display
         self.stack = []  # history of parent views
@@ -131,18 +165,14 @@ class RTreeViewer:
 
         # Determine if we are looking at leaf children (draw points)
         # or internal children (draw MBRs that can be drilled into).
-        # We always draw the MBRs of `indices`.
-        # If all of them are leaves, also scatter their points.
-
         all_leaf = all(n[i]["is_leaf"] for i in indices)
 
-        # Collect MBR rectangles
+        # Collect MBR rectangles — compute node MBR from children_mbrs
         rects = []
         mbr_list = []
         for idx in indices:
             nd = n[idx]
-            x0, y0 = float(nd["min_x"]), float(nd["min_y"])
-            x1, y1 = float(nd["max_x"]), float(nd["max_y"])
+            x0, y0, x1, y1 = compute_node_mbr(nd)
             w, h = x1 - x0, y1 - y0
             rects.append(Rectangle((x0, y0), max(w, 1e-6), max(h, 1e-6)))
             mbr_list.append((x0, y0, x1, y1, idx))
@@ -181,8 +211,7 @@ class RTreeViewer:
             parent_rects = []
             for pidx in parent_indices:
                 pnd = n[pidx]
-                x0, y0 = float(pnd["min_x"]), float(pnd["min_y"])
-                x1, y1 = float(pnd["max_x"]), float(pnd["max_y"])
+                x0, y0, x1, y1 = compute_node_mbr(pnd)
                 w, h = x1 - x0, y1 - y0
                 parent_rects.append(Rectangle((x0, y0), max(w, 1e-6), max(h, 1e-6)))
             pcolor = LEVEL_COLORS[(depth - 1) % len(LEVEL_COLORS)]
@@ -206,7 +235,7 @@ class RTreeViewer:
         node_type = "leaf" if all_leaf else "internal"
         ax.set_title(
             f"R-Tree  |  {level_name}  |  {len(indices)} {node_type} node(s)  |  "
-            f"height={self.hdr['height']}  leaf_cap={self.leaf_capacity}  int_cap={self.internal_capacity}  "
+            f"height={self.hdr['height']}  node_cap={self.node_capacity}  "
             f"nodes={self.hdr['num_nodes']}  points={self.hdr['num_points']}\n"
             f"Left-click MBR → drill down  |  Right-click → go back  |  "
             f"'r' → reset  |  'q' → quit",

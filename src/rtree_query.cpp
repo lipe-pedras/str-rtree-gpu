@@ -41,22 +41,35 @@ struct MBR {
 };
 
 struct RTreeNode {
-    MBR      mbr;
-    uint64_t first_child;
-    uint32_t num_children;
-    uint32_t is_leaf;
+    uint64_t first_child;                          // 8 bytes
+    MBR      children_mbrs[RTREE_NODE_CAPACITY];   // N × 16 bytes
+    uint32_t num_children;                         // 4 bytes
+    uint32_t is_leaf;                              // 4 bytes
 };
-static_assert(sizeof(RTreeNode) == 32);
+static_assert(sizeof(RTreeNode) == RTREE_NODE_BYTES);
 
 struct RTreeHeader {
     uint32_t magic;
-    uint32_t leaf_capacity;
+    uint32_t node_capacity;
     uint32_t height;
-    uint32_t internal_capacity;
+    uint32_t _reserved;
     uint64_t num_points;
     uint64_t num_nodes;
 };
 static_assert(sizeof(RTreeHeader) == 32);
+
+// Compute the overall MBR of a node (union of its children_mbrs).
+inline MBR compute_node_mbr(const RTreeNode& nd) {
+    MBR m{INFINITY, INFINITY, -INFINITY, -INFINITY};
+    for (uint32_t i = 0; i < nd.num_children; i++) {
+        const MBR& c = nd.children_mbrs[i];
+        m.min_x = std::min(m.min_x, c.min_x);
+        m.min_y = std::min(m.min_y, c.min_y);
+        m.max_x = std::max(m.max_x, c.max_x);
+        m.max_y = std::max(m.max_y, c.max_y);
+    }
+    return m;
+}
 
 // =========================================================
 // Memory-mapped R-tree handle
@@ -109,16 +122,15 @@ struct RTree {
     size_t root_index() const { return header->num_nodes - 1; }
 
     void print_info() const {
-        const auto& root = nodes[root_index()];
+        MBR root_mbr = compute_node_mbr(nodes[root_index()]);
         std::cout << std::fixed << std::setprecision(4)
                   << "R-Tree: " << header->num_points << " points, "
                   << header->num_nodes << " nodes, "
                   << header->height << " levels\n"
-                  << "  Leaf capacity:     " << header->leaf_capacity << "\n"
-                  << "  Internal capacity: " << header->internal_capacity << "\n"
-                  << "  Root MBR: [" << root.mbr.min_x << ", "
-                  << root.mbr.min_y << "] × ["
-                  << root.mbr.max_x << ", " << root.mbr.max_y << "]\n";
+                  << "  Node capacity:     " << header->node_capacity << "\n"
+                  << "  Root MBR: [" << root_mbr.min_x << ", "
+                  << root_mbr.min_y << "] × ["
+                  << root_mbr.max_x << ", " << root_mbr.max_y << "]\n";
     }
 };
 
@@ -160,24 +172,25 @@ void point_query_recurse(const RTree& rt, size_t node_idx,
     const RTreeNode& nd = rt.nodes[node_idx];
     stats.nodes_visited++;
 
-    if (!mbr_contains_point(nd.mbr, qx, qy))
-        return;
-
     if (nd.is_leaf) {
-        // Scan points in this leaf
+        // Each children_mbrs[i] is a point MBR {x,y,x,y}
         for (uint32_t i = 0; i < nd.num_children; i++) {
-            const Point& p = rt.points[nd.first_child + i];
-            stats.points_checked++;
-            if (p.x == qx && p.y == qy) {
-                results.push_back(p);
-                stats.results++;
+            if (mbr_contains_point(nd.children_mbrs[i], qx, qy)) {
+                const Point& p = rt.points[nd.first_child + i];
+                stats.points_checked++;
+                if (p.x == qx && p.y == qy) {
+                    results.push_back(p);
+                    stats.results++;
+                }
             }
         }
     } else {
-        // Recurse into children whose MBR contains the query point
+        // Check each child's MBR before recursing
         for (uint32_t i = 0; i < nd.num_children; i++) {
-            point_query_recurse(rt, nd.first_child + i, qx, qy,
-                                results, stats);
+            if (mbr_contains_point(nd.children_mbrs[i], qx, qy)) {
+                point_query_recurse(rt, nd.first_child + i, qx, qy,
+                                    results, stats);
+            }
         }
     }
 }
@@ -212,36 +225,35 @@ void range_query_recurse(const RTree& rt, size_t node_idx,
     const RTreeNode& nd = rt.nodes[node_idx];
     stats.nodes_visited++;
 
-    if (!mbr_intersects(nd.mbr, query))
-        return;
-
     if (nd.is_leaf) {
-        // Optimization: if query fully contains this leaf's MBR,
-        // all points match — no per-point check needed.
-        if (mbr_contains_mbr(query, nd.mbr)) {
-            stats.leaves_fully_contained++;
-            stats.results += nd.num_children;
-            if (results) {
-                for (uint32_t i = 0; i < nd.num_children; i++)
-                    results->push_back(rt.points[nd.first_child + i]);
-            }
-        } else {
-            // Partial overlap — check each point
-            for (uint32_t i = 0; i < nd.num_children; i++) {
-                const Point& p = rt.points[nd.first_child + i];
-                stats.points_checked++;
-                if (p.x >= query.min_x && p.x <= query.max_x &&
-                    p.y >= query.min_y && p.y <= query.max_y) {
-                    stats.results++;
-                    if (results) results->push_back(p);
-                }
+        for (uint32_t i = 0; i < nd.num_children; i++) {
+            if (!mbr_intersects(nd.children_mbrs[i], query))
+                continue;
+            // Point MBR fully inside query → point matches
+            const Point& p = rt.points[nd.first_child + i];
+            stats.points_checked++;
+            if (p.x >= query.min_x && p.x <= query.max_x &&
+                p.y >= query.min_y && p.y <= query.max_y) {
+                stats.results++;
+                if (results) results->push_back(p);
             }
         }
     } else {
-        // Recurse into children whose MBR intersects the query
         for (uint32_t i = 0; i < nd.num_children; i++) {
-            range_query_recurse(rt, nd.first_child + i, query,
-                                results, stats);
+            if (!mbr_intersects(nd.children_mbrs[i], query))
+                continue;
+
+            // Optimization: if query fully contains this child's MBR,
+            // we can still recurse but mark for bulk counting
+            if (mbr_contains_mbr(query, nd.children_mbrs[i])) {
+                // Count all points under this subtree
+                // For now, recurse (the leaf level will do fast matching)
+                range_query_recurse(rt, nd.first_child + i, query,
+                                    results, stats);
+            } else {
+                range_query_recurse(rt, nd.first_child + i, query,
+                                    results, stats);
+            }
         }
     }
 }

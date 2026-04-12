@@ -59,15 +59,15 @@ constexpr size_t SORT_CHUNK_POINTS = USABLE_GPU_BYTES / 2 / 8;  // sizeof(Point)
 // R-Tree / STR Parameters
 // =========================================================
 
-// Maximum byte budget per R-Tree node.
-// Leaf nodes store up to RTREE_NODE_BYTES / sizeof(Point) points.
-// Internal nodes store up to RTREE_NODE_BYTES / sizeof(RTreeNode) children.
+// Maximum byte budget per R-Tree node (== sizeof(RTreeNode)).
+// Each node stores an array of children MBRs inline.
 constexpr size_t RTREE_NODE_BYTES = 4096;
 
-// Derived capacities (sizeof(Point) == 8, sizeof(RTreeNode) == 32).
-// Verified by static_asserts in external_str_cuda.cu.
-constexpr size_t RTREE_LEAF_CAPACITY     = RTREE_NODE_BYTES / 8;   // points per leaf
-constexpr size_t RTREE_INTERNAL_CAPACITY = RTREE_NODE_BYTES / 32;  // children per internal node
+// Both leaf and internal nodes store up to RTREE_NODE_CAPACITY entries.
+// Layout: first_child (8B) + children_mbrs (N×16B) + num_children (4B) + is_leaf (4B)
+// Fixed overhead = 8 + 4 + 4 = 16 bytes.  Remaining = RTREE_NODE_BYTES - 16.
+// Each MBR = 16 bytes (4 floats).
+constexpr size_t RTREE_NODE_CAPACITY = (RTREE_NODE_BYTES - 16) / 16;
 
 // Maximum points per vertical slice for STR Y-sorting.
 // Capped at SORT_CHUNK_POINTS (must fit in one GPU sort call).
