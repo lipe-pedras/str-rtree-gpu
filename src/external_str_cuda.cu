@@ -41,6 +41,13 @@
 using Clock = std::chrono::high_resolution_clock;
 using Ms    = std::chrono::duration<double, std::milli>;
 
+// Threading contract for the global `g_stats` accumulator:
+//   - The async I/O worker NEVER writes g_stats directly. It returns its
+//     disk timings through a std::future; the MAIN thread folds them in
+//     (see generate_runs_cached / Phase 2).
+//   - All GPU-side fields are written only by the main thread (gpu_sort).
+//   Therefore no field is touched by two threads at once and no lock is
+//   needed. Preserve this invariant if you add new timed work.
 struct TimingStats {
     double disk_read_ms   = 0;
     double disk_write_ms  = 0;
@@ -49,10 +56,29 @@ struct TimingStats {
     double gpu_compute_ms = 0;
     double gpu_alloc_ms   = 0;
 
+    // Phase 1b k-way merge — CPU heap-merge work (host-side).
+    double cpu_merge_ms   = 0;
+
+    // Phase 3 (single-threaded, host-side) work — folded into the grand total
+    // so it reconciles with the total wall-clock time.
+    double tree_ms        = 0;  // build internal R-tree levels
+    double hdr_ms         = 0;  // header + nodes write
+
+    // Wall-clock elapsed for the phase this struct describes. Reflects the
+    // dual-thread overlap (GPU sort ‖ disk I/O); always <= COMPONENT SUM.
+    double wall_ms        = 0;
+
     size_t bytes_read     = 0;
     size_t bytes_written  = 0;
     size_t bytes_h2d      = 0;
     size_t bytes_d2h      = 0;
+
+    // Serialized cost: what the run would take with zero overlap.
+    double component_sum_ms() const {
+        return disk_read_ms + disk_write_ms + gpu_alloc_ms
+             + h2d_ms + gpu_compute_ms + d2h_ms
+             + cpu_merge_ms + tree_ms + hdr_ms;
+    }
 
     void print(const char* phase) const {
         auto bw = [](size_t bytes, double ms) -> double {
@@ -73,10 +99,21 @@ struct TimingStats {
                   << "  GPU compute:   " << gpu_compute_ms << " ms\n"
                   << "  D2H transfer:  " << d2h_ms         << " ms  ("
                   << bw(bytes_d2h, d2h_ms) << " MB/s, "
-                  << bytes_d2h / (1024.0*1024.0) << " MB)\n"
-                  << "  TOTAL:         "
-                  << (disk_read_ms + disk_write_ms + gpu_alloc_ms
-                      + h2d_ms + gpu_compute_ms + d2h_ms) << " ms\n";
+                  << bytes_d2h / (1024.0*1024.0) << " MB)\n";
+        if (cpu_merge_ms > 0)
+            std::cout << "  CPU merge:     " << cpu_merge_ms << " ms\n";
+        if (tree_ms > 0 || hdr_ms > 0)
+            std::cout << "  Tree build:    " << tree_ms     << " ms\n"
+                      << "  Header write:  " << hdr_ms      << " ms\n";
+
+        double comp = component_sum_ms();
+        std::cout << "  COMPONENT SUM: " << comp << " ms  (serialized cost)\n";
+        if (wall_ms > 0) {
+            std::cout << "  WALL:          " << wall_ms << " ms  (actual elapsed)\n"
+                      << "  OVERLAP SAVED: "
+                      << (comp > wall_ms ? comp - wall_ms : 0.0)
+                      << " ms  (GPU ‖ I/O concurrency)\n";
+        }
     }
 
     TimingStats& operator+=(const TimingStats& o) {
@@ -86,6 +123,9 @@ struct TimingStats {
         d2h_ms         += o.d2h_ms;
         gpu_compute_ms += o.gpu_compute_ms;
         gpu_alloc_ms   += o.gpu_alloc_ms;
+        cpu_merge_ms   += o.cpu_merge_ms;
+        tree_ms        += o.tree_ms;
+        hdr_ms         += o.hdr_ms;
         bytes_read     += o.bytes_read;
         bytes_written  += o.bytes_written;
         bytes_h2d      += o.bytes_h2d;
@@ -94,7 +134,7 @@ struct TimingStats {
     }
 };
 
-TimingStats g_stats;  // global accumulator
+TimingStats g_stats;  // global accumulator (see threading contract above)
 
 // =========================================================
 // Data structure
@@ -162,42 +202,91 @@ struct CompareY {
 // GPU SORT (chunk local)  — with detailed timing
 // =========================================================
 
+// Reusable device buffer + CUDA events, created once and grown on demand.
+// Avoids per-chunk cudaMalloc/cudaFree (and keeps the first-call CUDA context
+// init out of the per-sort alloc timing — see gpu_warmup()).
+static Point*      g_d_buf = nullptr;
+static size_t      g_d_cap = 0;    // capacity in bytes
+static cudaEvent_t g_ev_h2d0, g_ev_h2d1, g_ev_sort1, g_ev_d2h1;
+static bool        g_gpu_events_ready = false;
+
+static void gpu_ensure_events() {
+    if (g_gpu_events_ready) return;
+    cudaEventCreate(&g_ev_h2d0);
+    cudaEventCreate(&g_ev_h2d1);
+    cudaEventCreate(&g_ev_sort1);
+    cudaEventCreate(&g_ev_d2h1);
+    g_gpu_events_ready = true;
+}
+
+// Force CUDA context creation and a first device buffer up front, so the
+// one-time init cost is reported separately instead of polluting Phase 1a.
+double gpu_warmup(size_t bytes) {
+    auto t0 = Clock::now();
+    cudaFree(0);              // forces context init
+    gpu_ensure_events();
+    if (bytes > g_d_cap) {
+        cudaFree(g_d_buf);
+        cudaMalloc(&g_d_buf, bytes);
+        g_d_cap = bytes;
+    }
+    cudaDeviceSynchronize();
+    return Ms(Clock::now() - t0).count();
+}
+
 void gpu_sort(Point* host_data, size_t n, bool by_x) {
     size_t bytes = n * sizeof(Point);
-    Point* d_ptr_raw = nullptr;
 
-    // --- GPU alloc ---
+    // --- GPU alloc (grow reusable buffer only when needed) ---
     auto t0 = Clock::now();
-    cudaMalloc(&d_ptr_raw, bytes);
-    cudaDeviceSynchronize();
-    auto t1 = Clock::now();
-    g_stats.gpu_alloc_ms += Ms(t1 - t0).count();
+    if (bytes > g_d_cap) {
+        cudaFree(g_d_buf);
+        cudaMalloc(&g_d_buf, bytes);
+        g_d_cap = bytes;
+        cudaDeviceSynchronize();
+    }
+    gpu_ensure_events();
+    g_stats.gpu_alloc_ms += Ms(Clock::now() - t0).count();
+    Point* d_ptr_raw = g_d_buf;
 
-    // --- H2D ---
-    cudaMemcpy(d_ptr_raw, host_data, bytes, cudaMemcpyHostToDevice);
-    cudaDeviceSynchronize();
-    auto t2 = Clock::now();
-    g_stats.h2d_ms    += Ms(t2 - t1).count();
-    g_stats.bytes_h2d += bytes;
+    // --- H2D / sort / D2H, timed with CUDA events ---
+    cudaEventRecord(g_ev_h2d0);
+    cudaMemcpyAsync(d_ptr_raw, host_data, bytes, cudaMemcpyHostToDevice);
+    cudaEventRecord(g_ev_h2d1);
 
-    // --- GPU sort ---
     thrust::device_ptr<Point> d(d_ptr_raw);
     if (by_x)
         thrust::sort(d, d + n, CompareX());
     else
         thrust::sort(d, d + n, CompareY());
-    cudaDeviceSynchronize();
-    auto t3 = Clock::now();
-    g_stats.gpu_compute_ms += Ms(t3 - t2).count();
+    cudaEventRecord(g_ev_sort1);
 
-    // --- D2H ---
-    cudaMemcpy(host_data, d_ptr_raw, bytes, cudaMemcpyDeviceToHost);
-    cudaDeviceSynchronize();
-    auto t4 = Clock::now();
-    g_stats.d2h_ms    += Ms(t4 - t3).count();
-    g_stats.bytes_d2h += bytes;
+    cudaMemcpyAsync(host_data, d_ptr_raw, bytes, cudaMemcpyDeviceToHost);
+    cudaEventRecord(g_ev_d2h1);
+    cudaEventSynchronize(g_ev_d2h1);
 
-    cudaFree(d_ptr_raw);
+    float h2d_ms = 0, sort_ms = 0, d2h_ms = 0;
+    cudaEventElapsedTime(&h2d_ms,  g_ev_h2d0,  g_ev_h2d1);
+    cudaEventElapsedTime(&sort_ms, g_ev_h2d1,  g_ev_sort1);
+    cudaEventElapsedTime(&d2h_ms,  g_ev_sort1, g_ev_d2h1);
+
+    g_stats.h2d_ms         += h2d_ms;
+    g_stats.bytes_h2d      += bytes;
+    g_stats.gpu_compute_ms += sort_ms;
+    g_stats.d2h_ms         += d2h_ms;
+    g_stats.bytes_d2h      += bytes;
+}
+
+// Release the reusable GPU resources (optional; process teardown also frees).
+void gpu_cleanup() {
+    if (g_d_buf) { cudaFree(g_d_buf); g_d_buf = nullptr; g_d_cap = 0; }
+    if (g_gpu_events_ready) {
+        cudaEventDestroy(g_ev_h2d0);
+        cudaEventDestroy(g_ev_h2d1);
+        cudaEventDestroy(g_ev_sort1);
+        cudaEventDestroy(g_ev_d2h1);
+        g_gpu_events_ready = false;
+    }
 }
 
 // =========================================================
@@ -224,7 +313,13 @@ void generate_runs_cached(const std::string& input,
                           size_t points_per_chunk,
                           std::vector<CachedRun>& runs,
                           size_t& ram_budget) {
-    size_t chunk_bytes = points_per_chunk * sizeof(Point);
+    // A chunk never needs to be larger than the whole input. Cap the buffer
+    // so small datasets don't pay for SORT_CHUNK_POINTS-sized pinned host
+    // allocations (which can be gigabytes and dominate the wall time).
+    size_t file_points = std::filesystem::file_size(input) / sizeof(Point);
+    size_t eff_chunk_points = std::min(points_per_chunk,
+                                       std::max<size_t>(file_points, 1));
+    size_t chunk_bytes = eff_chunk_points * sizeof(Point);
 
     // 2 pinned host buffers for dual-thread pipeline
     Point* bufs[2];
@@ -488,7 +583,8 @@ void kway_merge(std::vector<CachedRun>& runs,
     std::make_heap(heap.begin(), heap.end(), cmp);
 
     if (all_in_memory) {
-        // Merge to memory — no disk I/O
+        // Merge to memory — no disk I/O, pure CPU heap merge.
+        auto t0 = Clock::now();
         mem_output.resize(total_points);
         size_t pos = 0;
 
@@ -507,8 +603,12 @@ void kway_merge(std::vector<CachedRun>& runs,
                 r.close_and_delete();
             }
         }
+        g_stats.cpu_merge_ms += Ms(Clock::now() - t0).count();
     } else {
-        // Merge to file
+        // Merge to file. Disk writes are timed in flush(); the rest of the
+        // loop is CPU heap-merge work, recovered as elapsed minus disk time.
+        auto merge_t0 = Clock::now();
+        double disk_before = g_stats.disk_write_ms;
         std::vector<Point> out_buf(buf_points);
         size_t out_pos = 0;
         std::ofstream fout(disk_output, std::ios::binary);
@@ -543,6 +643,8 @@ void kway_merge(std::vector<CachedRun>& runs,
 
         flush();
         fout.close();
+        double elapsed = Ms(Clock::now() - merge_t0).count();
+        g_stats.cpu_merge_ms += elapsed - (g_stats.disk_write_ms - disk_before);
     }
 
     // Free cached run data
@@ -704,6 +806,12 @@ void external_str_build(const std::string& input,
 
     auto wall_start = Clock::now();
 
+    // One-time GPU context init + first device-buffer alloc, timed separately
+    // so it doesn't inflate Phase 1a's alloc numbers.
+    double init_ms = gpu_warmup(SORT_CHUNK_POINTS * sizeof(Point));
+    std::cout << std::fixed << std::setprecision(2)
+              << "GPU init (context + buffer): " << init_ms << " ms\n";
+
     // =====================================================
     // Phase 1a: Generate X-sorted runs
     // =====================================================
@@ -715,6 +823,7 @@ void external_str_build(const std::string& input,
     generate_runs_cached(input, SORT_CHUNK_POINTS, runs, ram_budget);
 
     TimingStats gen_stats = g_stats;
+    gen_stats.wall_ms = Ms(Clock::now() - phase1a_start).count();
     gen_stats.print("Phase 1a \u2014 Generate X-sorted runs");
 
     size_t cached = 0, on_disk = 0;
@@ -730,6 +839,7 @@ void external_str_build(const std::string& input,
     // Phase 1b: Merge X-sorted runs
     // =====================================================
     g_stats = {};
+    auto phase1b_start = Clock::now();
 
     const std::string sorted_x = "tmp/sorted_x.bin";
     std::vector<Point> sorted_mem;
@@ -752,6 +862,7 @@ void external_str_build(const std::string& input,
     }
 
     TimingStats merge_stats = g_stats;
+    merge_stats.wall_ms = Ms(Clock::now() - phase1b_start).count();
     merge_stats.print("Phase 1b \u2014 Merge X-sorted runs");
 
     auto phase1_end = Clock::now();
@@ -956,9 +1067,8 @@ void external_str_build(const std::string& input,
         std::filesystem::remove(sorted_x);
 
     TimingStats tile_stats = g_stats;
+    tile_stats.wall_ms = Ms(Clock::now() - phase2_start).count();
     tile_stats.print("Phase 2 \u2014 STR Y-sort + leaf MBRs + write");
-    std::cout << "Phase 2 wall time: "
-              << Ms(Clock::now() - phase2_start).count() << " ms\n";
 
     // =====================================================
     // Phase 3: Build internal R-tree levels + write header
@@ -1000,25 +1110,33 @@ void external_str_build(const std::string& input,
               << nodes.back().mbr.max_x << ", "
               << nodes.back().mbr.max_y << "]\n";
 
+    TimingStats phase3_stats;
+    phase3_stats.tree_ms = tree_ms;
+    phase3_stats.hdr_ms  = hdr_ms;
+    phase3_stats.wall_ms = tree_ms + hdr_ms;  // single-threaded, no overlap
+    phase3_stats.print("Phase 3 — Build internal levels + write header");
+
+    auto wall_end = Clock::now();
+
     // =====================================================
-    // Grand total
+    // Grand total — folds in every phase (incl. Phase 3) so the WALL line
+    // reconciles with the total wall-clock time below.
     // =====================================================
     TimingStats total_stats;
     total_stats += gen_stats;
     total_stats += merge_stats;
     total_stats += tile_stats;
-    total_stats.print("GRAND TOTAL (I/O + GPU)");
+    total_stats += phase3_stats;
+    total_stats.wall_ms = Ms(wall_end - wall_start).count();
+    total_stats.print("GRAND TOTAL (I/O + GPU + tree)");
 
     size_t out_bytes = sizeof(RTreeHeader)
                      + nodes.size() * sizeof(RTreeNode)
                      + total_points * sizeof(Point);
 
-    auto wall_end = Clock::now();
+    gpu_cleanup();
+
     std::cout << std::fixed << std::setprecision(2)
-              << "  R-Tree build:      " << tree_ms << " ms  ("
-              << num_nodes << " nodes)\n"
-              << "  Header+nodes write:" << hdr_ms << " ms  ("
-              << points_offset / (1024.0*1024.0) << " MB)\n"
               << "\nTotal wall-clock time: "
               << Ms(wall_end - wall_start).count() / 1000.0
               << " s\n"
