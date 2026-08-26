@@ -28,7 +28,9 @@ CXXFLAGS  := -O3 -std=c++17
 # Default target
 # ----------------------------------------------------------------
 .PHONY: all
-all: $(BIN_DIR)/external_str $(BIN_DIR)/external_str_cpu $(BIN_DIR)/rtree_query $(BIN_DIR)/gen_points $(BIN_DIR)/gpu_info
+all: $(BIN_DIR)/external_str $(BIN_DIR)/external_str_cpu $(BIN_DIR)/rtree_query \
+     $(BIN_DIR)/gen_points $(BIN_DIR)/gpu_info \
+     $(BIN_DIR)/str_rtree $(BIN_DIR)/rect_rtree_query $(BIN_DIR)/gen_rects
 
 # ----------------------------------------------------------------
 # Binaries
@@ -48,6 +50,18 @@ $(BIN_DIR)/gen_points: $(SRC_DIR)/gen_points.cpp
 $(BIN_DIR)/gpu_info: $(SRC_DIR)/gpu_info.cu
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
+# ---- textbook-layout STR R-Tree over rectangles (refactor/the-return-of-the-programer)
+RECT_HDRS := $(SRC_DIR)/rect_constants.h $(SRC_DIR)/rect_rtree_format.h
+
+$(BIN_DIR)/str_rtree: $(SRC_DIR)/str_rtree_cuda.cu $(RECT_HDRS)
+	$(NVCC) $(NVCCFLAGS) $< -o $@
+
+$(BIN_DIR)/rect_rtree_query: $(SRC_DIR)/rect_rtree_query.cpp $(RECT_HDRS)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+$(BIN_DIR)/gen_rects: $(SRC_DIR)/gen_rects.cpp $(RECT_HDRS)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
 # ----------------------------------------------------------------
 # Utility targets
 # ----------------------------------------------------------------
@@ -55,7 +69,9 @@ $(BIN_DIR)/gpu_info: $(SRC_DIR)/gpu_info.cu
 
 # Remove compiled binaries (keeps directories)
 clean:
-	rm -f $(BIN_DIR)/external_str $(BIN_DIR)/external_str_cpu $(BIN_DIR)/rtree_query $(BIN_DIR)/gen_points $(BIN_DIR)/gpu_info
+	rm -f $(BIN_DIR)/external_str $(BIN_DIR)/external_str_cpu $(BIN_DIR)/rtree_query \
+	      $(BIN_DIR)/gen_points $(BIN_DIR)/gpu_info \
+	      $(BIN_DIR)/str_rtree $(BIN_DIR)/rect_rtree_query $(BIN_DIR)/gen_rects
 
 # Remove intermediate sort files left in tmp/
 clean-tmp:
@@ -88,4 +104,10 @@ help:
 	@echo "  ./bin/gen_points <N>                        # writes data/points.bin"
 	@echo "  ./bin/gen_points <N> <output>               # writes to custom path"
 	@echo "  ./bin/external_str data/points.bin data/rtree.bin"
+	@echo ""
+	@echo "Rectangle R-Tree (textbook node layout):"
+	@echo "  ./bin/gen_rects <N> [out.bin] [--clustered K]"
+	@echo "  ./bin/str_rtree data/rects.bin data/tree.bin [--fill-leaf F] [--fill-internal F]"
+	@echo "  ./bin/rect_rtree_query data/tree.bin verify data/rects.bin"
+	@echo "  ./bin/rect_rtree_query data/tree.bin bench  data/rects.bin 0.01 20"
 	@echo ""
