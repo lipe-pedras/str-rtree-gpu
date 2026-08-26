@@ -106,7 +106,7 @@ struct TimingStats {
         if (cpu_merge_ms > 0) std::cout << "  CPU merge:     " << cpu_merge_ms << " ms\n";
         if (pack_ms      > 0) std::cout << "  Pack + MBR:    " << pack_ms      << " ms\n";
         if (setup_ms     > 0) std::cout << "  Buffer/cache:  " << setup_ms     << " ms  "
-                                        << "(pinned alloc ~1 ms/MB + RAM-cache copies)\n";
+                                        << "(pinned alloc ~0.53 ms/MB + RAM-cache copies)\n";
 
         double c = component_sum_ms();
         std::cout << "  COMPONENT SUM: " << c << " ms  (serialized cost)\n";

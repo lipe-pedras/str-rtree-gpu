@@ -63,6 +63,23 @@ $(BIN_DIR)/gen_rects: $(SRC_DIR)/gen_rects.cpp $(RECT_HDRS)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 # ----------------------------------------------------------------
+# Benchmarks (see bench/ and the methodology section of context.md)
+# ----------------------------------------------------------------
+BENCH_DIR := bench
+
+.PHONY: bench
+bench: $(BIN_DIR)/bench_sort_crossover $(BIN_DIR)/bench_pinned_memory $(BIN_DIR)/bench_context_init
+
+$(BIN_DIR)/bench_sort_crossover: $(BENCH_DIR)/bench_sort_crossover.cu $(RECT_HDRS)
+	$(NVCC) $(NVCCFLAGS) -I$(SRC_DIR) $< -o $@
+
+$(BIN_DIR)/bench_pinned_memory: $(BENCH_DIR)/bench_pinned_memory.cu
+	$(NVCC) $(NVCCFLAGS) $< -o $@
+
+$(BIN_DIR)/bench_context_init: $(BENCH_DIR)/bench_context_init.cu
+	$(NVCC) $(NVCCFLAGS) $< -o $@
+
+# ----------------------------------------------------------------
 # Utility targets
 # ----------------------------------------------------------------
 .PHONY: clean clean-tmp clean-data help
@@ -71,7 +88,9 @@ $(BIN_DIR)/gen_rects: $(SRC_DIR)/gen_rects.cpp $(RECT_HDRS)
 clean:
 	rm -f $(BIN_DIR)/external_str $(BIN_DIR)/external_str_cpu $(BIN_DIR)/rtree_query \
 	      $(BIN_DIR)/gen_points $(BIN_DIR)/gpu_info \
-	      $(BIN_DIR)/str_rtree $(BIN_DIR)/rect_rtree_query $(BIN_DIR)/gen_rects
+	      $(BIN_DIR)/str_rtree $(BIN_DIR)/rect_rtree_query $(BIN_DIR)/gen_rects \
+	      $(BIN_DIR)/bench_sort_crossover $(BIN_DIR)/bench_pinned_memory \
+	      $(BIN_DIR)/bench_context_init
 
 # Remove intermediate sort files left in tmp/
 clean-tmp:
@@ -110,4 +129,12 @@ help:
 	@echo "  ./bin/str_rtree data/rects.bin data/tree.bin [--fill-leaf F] [--fill-internal F]"
 	@echo "  ./bin/rect_rtree_query data/tree.bin verify data/rects.bin"
 	@echo "  ./bin/rect_rtree_query data/tree.bin bench  data/rects.bin 0.01 20"
+	@echo ""
+	@echo "Benchmarks / tests:"
+	@echo "  make bench                        Build the microbenchmarks"
+	@echo "  ./bin/bench_sort_crossover 24 5   GPU vs CPU sort break-even"
+	@echo "  ./bin/bench_pinned_memory 3       Pinned alloc cost vs H2D bandwidth"
+	@echo "  ./bin/bench_context_init          CUDA start-up cost (run cold, then warm)"
+	@echo "  ./bench/sweep_pinned_cap.sh <input.bin>"
+	@echo "  ./bench/test_correctness.sh [N]   Full correctness matrix"
 	@echo ""

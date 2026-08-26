@@ -51,11 +51,18 @@ constexpr size_t MERGE_BUFFER_BYTES = 2ULL * 1024 * 1024 * 1024;     // 2 GB
 
 // Upper bound on a single pinned staging buffer.
 //
-// MEASURED: cudaMallocHost costs ~1 ms per MB and cudaFreeHost ~0.25 ms per MB,
-// both LINEAR in size, while H2D bandwidth is FLAT at ~13.3 GB/s from 64 MB
-// upward (64 MB: 13.07 GB/s, 1350 MB: 13.34 GB/s).  A giant pinned buffer
-// therefore costs seconds to allocate and buys nothing in transfer rate:
-// 2 x 1350 MB of staging cost 2.7 s to allocate plus 0.7 s to free.
+// MEASURED (bench/bench_pinned_memory.cu, best of 3):
+//   cudaMallocHost ~0.53 ms/MB and cudaFreeHost ~0.18 ms/MB, both strictly
+//   LINEAR in size, while H2D bandwidth is FLAT at 13.33-13.40 GB/s from
+//   64 MB all the way to 1350 MB.
+//
+//   Note plain malloc + memset of the same size costs ~0.45 ms/MB, so PINNING
+//   only adds ~20%: most of the cost is simply first-touching the pages.  That
+//   does not change the conclusion, it just relocates the blame.
+//
+// So a giant pinned buffer costs real time and buys nothing in transfer rate:
+// 2 x 1350 MB of staging is ~1.45 s to allocate plus ~0.48 s to free, for
+// identical bandwidth to a 64 MB buffer.
 //
 // So the GPU sort chunk is capped here rather than at the GPU budget.  The
 // cost of a smaller chunk is more runs (k) for the merge, which raises the

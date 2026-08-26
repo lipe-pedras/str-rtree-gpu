@@ -1101,18 +1101,38 @@ it**, versus the ~273 ms floor predicted for the comparison-sort path.
 
 ### 12.3 Pinned memory: linear cost, flat benefit
 
-| Buffer | `cudaMallocHost` | `cudaFreeHost` | H2D bandwidth |
-|---:|---:|---:|---:|
-| 64 MB | 63.9 ms | 22.7 ms | **13.07 GB/s** |
-| 256 MB | 259.5 ms | 86.9 ms | **13.35 GB/s** |
-| 512 MB | 565.9 ms | 209.1 ms | **13.42 GB/s** |
-| 1024 MB | 1054.7 ms | 337.0 ms | **13.34 GB/s** |
-| 1350 MB | 1373.4 ms | 345.3 ms | **13.34 GB/s** |
+Best of 3 trials (`bench/bench_pinned_memory.cu`):
 
-**Pinned allocation costs ~1 ms per MB, perfectly linear. Transfer bandwidth is
-flat from 64 MB upward.** A large pinned buffer therefore costs seconds and
-buys nothing. Sizing the sort chunk at the *GPU* budget meant two 1.35 GB pinned
-buffers — **2.7 s to allocate and 0.7 s to free, for zero bandwidth gain.**
+| Buffer | `cudaMallocHost` | `cudaFreeHost` | **ms/MB** | `malloc`+memset | H2D bandwidth |
+|---:|---:|---:|---:|---:|---:|
+| 64 MB | 34.8 ms | 12.3 ms | **0.544** | 28.8 ms | **13.33 GB/s** |
+| 128 MB | 69.3 ms | 23.8 ms | **0.541** | 56.8 ms | **13.40 GB/s** |
+| 256 MB | 134.7 ms | 46.3 ms | **0.526** | 111.7 ms | **13.35 GB/s** |
+| 512 MB | 270.9 ms | 91.6 ms | **0.529** | 218.5 ms | **13.37 GB/s** |
+| 1024 MB | 541.1 ms | 181.2 ms | **0.528** | 436.1 ms | **13.36 GB/s** |
+| 1350 MB | 726.8 ms | 239.7 ms | **0.538** | 578.7 ms | **13.36 GB/s** |
+
+**Pinned allocation costs ~0.53 ms per MB, and the ms/MB column is flat to
+within 3% across a 21× size range — the cost is exactly linear. Transfer
+bandwidth is flat too, 13.33–13.40 GB/s, varying by less than 0.6%.** So a
+large pinned buffer costs real time and buys precisely nothing: sizing the sort
+chunk at the *GPU* budget meant two 1.35 GB pinned buffers, **~1.45 s to
+allocate and ~0.48 s to free, for identical bandwidth to a 64 MB buffer.**
+
+Two honest refinements to this result:
+
+- **Most of the cost is not pinning.** Plain `malloc` + `memset` of the same
+  size costs ~0.45 ms/MB, so page-locking adds only ~20% over simply
+  first-touching the pages. The conclusion is unchanged but the blame moves:
+  it is *the size of the buffer*, not its pinned-ness, that costs.
+- **An earlier single-trial run of this same benchmark reported ~1 ms/MB**,
+  roughly double. That measurement was taken immediately after a 60 M build,
+  with ~2.8 GB of dataset and tree still in the page cache and the allocator
+  under pressure. Best-of-3 in a quiet state is the defensible number; the
+  single-trial figure is what this cost looks like *under memory pressure*,
+  which is arguably the more realistic operating condition and is worth
+  reporting as a range rather than a point. **0.53 ms/MB quiet, up to
+  ~1 ms/MB under pressure.**
 
 Also note: **13.3 GB/s realized** against 15.8 GB/s theoretical for PCIe 4.0 x8
 = 84% of peak. That settles the open question in §2.3 — the link is running at
@@ -1292,3 +1312,250 @@ make                                  # builds old and new binaries into bin/
 ./bin/rect_rtree_query data/tree.bin bench  data/rects.bin 0.01 20 # vs brute force
 ./bin/rect_rtree_query data/tree.bin range  100 100 200 200 --count
 ```
+
+
+---
+
+## 15. Methodology — how each measurement was taken
+
+Everything in §12 comes from one of six instruments, all in the repository so
+the numbers can be re-derived rather than trusted. This section states, for
+each, *what it measures, what it deliberately excludes, and what it cannot
+tell you.*
+
+### 15.0 The instruments
+
+| Instrument | Answers |
+|---|---|
+| [bench/bench_sort_crossover.cu](bench/bench_sort_crossover.cu) | Where does GPU sorting start to beat CPU sorting? (§12.1) |
+| [bench/bench_pinned_memory.cu](bench/bench_pinned_memory.cu) | What does pinned memory cost, and what does it buy? (§12.3) |
+| [bench/bench_context_init.cu](bench/bench_context_init.cu) | What are the one-time CUDA start-up costs? (§12.5) |
+| [bench/sweep_pinned_cap.sh](bench/sweep_pinned_cap.sh) | Where is the chunk-cap optimum? (§12.4) |
+| [bench/test_correctness.sh](bench/test_correctness.sh) | Is the tree right, on every code path? (§12.8) |
+| `str_rtree`'s own `TimingStats` + `rect_rtree_query bench` | Where does build time go? How good is the tree? (§12.6, §12.7) |
+
+```bash
+make bench                                    # builds the three microbenchmarks
+./bin/bench_sort_crossover 24 5               # max log2(n), trials
+./bin/bench_pinned_memory 3                   # trials
+./bin/bench_context_init                      # run cold, then again warm
+./bench/sweep_pinned_cap.sh data/rects_60m.bin 64 128 256 512 1024
+./bench/test_correctness.sh 1000000
+```
+
+### 15.1 Environment and what was (not) controlled
+
+Single machine, as in §6.5: RTX 3050 Laptop 4 GB / Ryzen 5 6600H 6C-12T /
+14 GB DDR5 / CUDA 12.0 / g++ 13 / `-O3 -std=c++17 -arch=sm_86`.
+
+**Held fixed across comparisons:** the input file, the output path (so
+page-cache state is comparable between rows), compiler and flags, RNG seeds,
+and — in the sweep — every constant except the single one under test.
+
+**Not controlled, and this is a laptop, so it matters:** CPU and GPU frequency
+scaling, thermal throttling, and background system load. `lscpu` reported the
+CPU at 38% of nominal scaling at one point during this work. Nothing here was
+run under a fixed-frequency governor or with the GPU clock locked. Treat all
+absolute timings as ±10% and all *ratios measured within a single process* as
+much tighter.
+
+### 15.2 Sort crossover (§12.1)
+
+**What it does.** For each `n` in a ×4 geometric sweep from 1 Ki to 16 Mi, it
+times two arms over the same data:
+
+- *CPU arm*: refill a pinned host buffer from an untouched master copy, then
+  `std::sort` with the **same centroid comparator the loader itself uses**.
+- *GPU arm*: refill the same buffer, then time the **complete round trip** —
+  H2D copy, key-extraction kernel, `sort_by_key`, D2H copy.
+
+**Controls.** The refill is *outside* the timer in both arms, so neither is
+charged for staging its own input. Both sort identical data. Best of 5 trials
+is reported, which favours both arms equally.
+
+**Deliberately excluded, because production code pays them once rather than per
+sort:** CUDA context creation (forced before the sweep), `cudaMalloc` of the
+device buffers (hoisted out of the loop), and `cudaMallocHost` of the pinned
+buffer (hoisted; measured separately in §12.3). **This matters for
+interpretation:** the table describes a sort into a *reused* buffer, which is
+what the loader does. For a one-shot sort you must add ~0.53 ms/MB of pinned
+allocation back, which pushes the crossover substantially higher.
+
+**Why `gpu_sort_only` is reported separately.** The gap between it and
+`gpu_total` *is* the PCIe transfer tax, isolated. That is the whole §2.4
+break-even argument reduced to two columns.
+
+**What it cannot tell you.** Nothing about multi-threaded CPU sorting — the CPU
+arm is one core. The GPU-vs-CPU ratios here are therefore an **upper bound on
+the honest speedup**, and §13's open item 2 stands.
+
+### 15.3 Pinned memory (§12.3)
+
+**Procedure**, per size, best of 3: time `cudaMallocHost`; `memset` the whole
+buffer so every page is resident (otherwise the first H2D would also be paying
+first-touch faults, conflating two costs); time an H2D `cudaMemcpy` of
+`min(size, 1 GB)` and derive GB/s; time `cudaFreeHost`; and, as a control, time
+`malloc` + `memset` of the same size.
+
+**The `malloc`+`memset` control is the important design choice here.** Without
+it you would conclude "pinning is expensive". With it you can see that plain
+first-touch is ~0.45 ms/MB and pinning is ~0.53 ms/MB, i.e. **page-locking adds
+only ~20%** and the dominant cost is simply having a large buffer at all.
+
+**Two independent checks that the result is real:** the ms/MB column is flat to
+within 3% across a 21× size range (so the cost is genuinely linear, not an
+artefact of one size), and the bandwidth column varies by less than 0.6% (so
+the flat-bandwidth claim is not noise).
+
+**Known weakness.** Best-of-3 in a quiet system. The single-trial numbers taken
+under memory pressure were ~2× higher (§12.3). Both are reported; a proper
+treatment would sweep system memory pressure as a second variable.
+
+### 15.4 CUDA context initialisation (§12.5)
+
+**Procedure.** A single process times, as consecutive laps: `cudaFree(0)`
+(which forces context creation), event creation, first and second `cudaMalloc`,
+a synchronize, the **first** `thrust::sort` (which pays CUB module load / JIT),
+and a **second** `thrust::sort` for the steady-state contrast.
+
+**The cold/warm protocol.** With persistence mode disabled
+(`nvidia-smi --query-gpu=persistence_mode`), the driver tears down GPU state
+after idling. So: run once after the GPU has been idle (**cold**), then
+immediately again (**warm**). Cold `cudaFree(0)` measured **1717 ms**; warm
+measured **126–179 ms** across runs.
+
+**Why this is in the methods section and not just the results.** It caused a
+real analysis error during this work: the phase walls appeared not to reconcile
+with the grand total by 1.6 s, which looked like an instrumentation bug. It was
+a cold run's *total* being compared against a warm run's *init line* — two
+different runs. **Any benchmark table that mixes cold and warm CUDA processes
+is silently corrupt.** Every number in §12 comes from warm runs, and the loader
+reports `GPU init` on its own line so the reader can check.
+
+### 15.5 Chunk-cap sweep (§12.4)
+
+**Procedure.** For each cap, `sed` rewrites the single constant
+`MAX_PINNED_CHUNK_BYTES` into a scratch copy of the headers, recompiles the
+loader, and runs a full end-to-end build of the same 60 M-rectangle file to the
+same output path. Nothing else varies between rows.
+
+**Why the per-phase columns are trustworthy and the total is not.** Phase A
+wall and merge time are **monotone** in the cap and move in *opposite*
+directions, which is exactly what the model predicts (allocation cost up,
+`log k` down) — a monotone response to a swept parameter is strong evidence.
+The total column is one build per cap and carries roughly **±1 s** of
+run-to-run variance from page-cache and thermal state; note that 512 MB scored
+7.76 s while 1024 MB scored 6.70 s, which is not a real inversion. **The
+conclusion drawn is only "there is a broad flat basin at 128–256 MB", which
+both the monotone columns and the totals support. No sharper claim is
+warranted from one trial per point.**
+
+### 15.6 In-loader instrumentation (§12.7)
+
+The loader times itself, and the design of that timing is itself a result.
+
+- **CUDA events, not host clocks**, for H2D / kernel / D2H, because the copies
+  are asynchronous and a host timer would measure the wrong interval.
+- **Threading contract**: the async I/O worker *never* writes the global stats.
+  It returns its disk timings through a `std::future` and the main thread folds
+  them in. No field is touched by two threads, so no lock is needed and no
+  counter can tear. The contract is documented in the source so it survives
+  edits.
+- **`gpu_warmup()`** forces context creation before Phase A so the §15.4 cost
+  is reported on its own line rather than inflating the first sort.
+- **Component sum vs wall, reported in *both* directions.** Each phase prints
+  the sum of its instrumented components *and* its wall-clock elapsed. If
+  components exceed wall, the difference is `OVERLAP SAVED` — the measured
+  value of running the GPU sort concurrently with the serialized I/O stream. If
+  wall exceeds components, the difference is `UNTRACKED` — work happening
+  inside the phase that nothing times.
+
+  **The `UNTRACKED` line exists because its absence hid a bug.** The original
+  version reported only the overlap direction and printed 0 otherwise, which
+  concealed ~6 s of pinned-buffer allocation in a 10 s build. After adding
+  explicit accounting for buffer allocation and RAM-cache copies, untracked
+  time fell from **6.4 s to 429 ms (5.8% of wall)**. *A one-directional
+  reconciliation is not a reconciliation.*
+
+### 15.7 Correctness matrix (§12.8)
+
+`bench/test_correctness.sh` exercises distinct **code paths**, not merely
+distinct input sizes:
+
+| Dimension | Values | Path exercised |
+|---|---|---|
+| Distribution | uniform, 50 gaussian clusters | tiling quality, not just validity |
+| Fill factors | 1.0, 0.7, leaf 0.5 / internal 1.0, 0.25 | capacity arithmetic, tree height (0.25 forces height 4) |
+| Memory regime | default budgets vs 8 MB GPU / 2 MB RAM | in-RAM merge vs **forced disk spill** |
+
+`verify` walks the entire tree and checks five independent invariants:
+
+1. every page holds between 1 and its effective capacity entries;
+2. **every parent entry's stored MBR contains its child subtree's actual
+   union** — recomputed bottom-up during the walk, so a wrong MBR anywhere is
+   caught;
+3. **every object ID appears exactly once**, via a bitmap over all IDs — this
+   catches both loss and duplication, which a count alone would not;
+4. the walked page count matches the header;
+5. a sample of source rectangles round-trips: each must be returned by a range
+   query over its own extent.
+
+Independently, the build asserts its node count and height against the
+closed-form `precompute_num_nodes` / `precompute_height`. **These are two
+genuinely independent checks** — one structural arithmetic, one an actual walk
+— and they agreed in every configuration.
+
+**The equivalence test is the subtle one.** The in-RAM and spilled paths produce
+*different trees*. Rather than treat that as a failure, the script checks the
+property that actually matters: **four fixed range queries must return
+identical counts from both trees.** They do. The cause was then confirmed
+directly with numpy — 1,000,000 rectangles yield only 975,497 distinct
+centroid-X keys at float32 precision, so **2.5% of records are tied** and the
+two paths order them differently. Both are valid STR trees.
+
+### 15.8 Query benchmark (§12.6)
+
+**Procedure.** For each selectivity, a query box of side
+`sqrt(selectivity) × root extent` is placed at 15–20 uniformly random positions
+inside the root MBR (fixed seed), run in `--count` mode so result storage does
+not pollute the timing, and averaged. The tool reports pages read, MBR tests,
+tests per page, pruned subtrees, and time. One query per run is additionally
+cross-checked against a **full brute-force scan of the source file**, and the
+counts must match exactly.
+
+**The critical caveat: these are warm-page-cache numbers.** The 60 M tree is
+1.4 GB on a 14 GB machine and had just been written and walked, so it was
+entirely resident. The `time` column therefore measures traversal and memory
+access, **not disk**. Cold-cache query latency is unmeasured and would be
+dominated by page faults.
+
+**Which is exactly why `tests per page` is the headline metric and not time.**
+Pages read and MBR tests are **counts of work, independent of cache state,
+clock speed and machine** — they are properties of the tree's shape. That the
+metric saturates its theoretical ceiling (166.9–170.0 out of 170) is a
+structural claim that survives being re-measured on other hardware, whereas the
+0.105 ms is not.
+
+### 15.9 What these tests do *not* establish
+
+Stated plainly, because an article should:
+
+1. **No honest speedup headline.** There is no CPU control group for the
+   rewrite, and the CPU sort arm in §12.1 is single-threaded. Every GPU-vs-CPU
+   ratio here is an upper bound.
+2. **No larger-than-RAM run.** The spill path is verified only with
+   artificially shrunken budgets. The three-regime table of §3.1 is confirmed
+   for regimes 1 and 2 and only *simulated* for regime 3. A genuine ≥ 220 M
+   rectangle (> 5 GB) build is still owed.
+3. **No cold-cache query numbers**, per §15.8.
+4. **No real-world data.** Uniform and simple gaussian clusters only. Real
+   spatial skew (OSM, TIGER, trajectories) is where STR is theoretically
+   weakest and remains untested for *quality* — clustered input is verified
+   **correct**, but its `tests per page` was not compared against uniform at
+   matched scale.
+5. **One machine, one GPU, one CUDA version.** Every constant in
+   `rect_constants.h` is calibrated to this hardware; the *shapes* of the
+   curves should transfer, the *values* should not be assumed to.
+6. **Best-of-N reporting.** Minimums suppress noise but hide variance. Medians
+   and spreads are not reported, and for the build sweep there is only one
+   trial per point.
