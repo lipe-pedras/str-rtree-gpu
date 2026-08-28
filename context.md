@@ -4,6 +4,10 @@
 > the findings, the supporting measurements-to-be, and the references.
 > **[TODO — measure]** marks claims that need numbers from real runs.
 >
+> **Sections 16–17 are the newest work**: a k-way merge study that replaced
+> Phase B's algorithm, and the CPU control group that finally makes an honest
+> GPU-vs-CPU speedup statement possible.
+>
 > **Sections 1–10 describe the first implementation** (points, self-MBR node
 > layout, `external_str_*`). **Sections 11–14 describe the rewrite**
 > (`refactor/the-return-of-the-programer`): rectangles, textbook node layout,
@@ -1559,3 +1563,257 @@ Stated plainly, because an article should:
 6. **Best-of-N reporting.** Minimums suppress noise but hide variance. Medians
    and spreads are not reported, and for the build sweep there is only one
    trial per point.
+
+
+---
+
+## 16. The k-way merge study
+
+After the sort was moved to a radix sort on the GPU, the merge became the
+largest cost in a 60 M build (§12.7). This section is the investigation into
+whether that was fixable. Instrument:
+[bench/bench_kway_merge.cu](bench/bench_kway_merge.cu).
+
+### 16.1 The regime question, and a refuted assumption
+
+The merge reads every run once and writes the result once, which is already
+I/O-optimal. **§3.3 asserted that a spilled merge is therefore I/O-bound and
+the algorithm cannot matter. That assumption is wrong, and the benchmark
+refutes it.**
+
+Measured against a cold-cache, `fsync`ed copy floor (runs written, `sync`ed,
+and evicted with `posix_fadvise(POSIX_FADV_DONTNEED)` before every trial):
+
+| N | traffic | I/O floor | binary heap | loser tree | heap ÷ floor |
+|---:|---:|---:|---:|---:|---:|
+| 16 M | 0.77 GB | 420.9 ms (1.82 GB/s) | 2458.5 ms | 1751.2 ms | **5.8×** |
+| 64 M | 3.07 GB | 1625.3 ms (1.89 GB/s) | 7405.0 ms | 6325.8 ms | **4.6×** |
+
+**Even with runs on cold disk, the merge costs 4–6× the pure-I/O floor.** The
+reason is that the reads are *synchronous*: a reader blocks on `refill()`, so
+the cost is `I/O + CPU` rather than `max(I/O, CPU)`. The disk is not the
+constraint; the serialization is.
+
+*(Methodology note: an earlier version of this measurement reported warm runs
+as **slower** than cold ones — a physical impossibility that revealed the bug.
+Writes were only dirtying page cache, so each run's write cost landed inside
+the *next* measurement. The fix was `fsync` inside the timed region plus a
+system-wide `sync()` before each eviction. Without that, every number here was
+meaningless.)*
+
+### 16.2 In-RAM strategies compared
+
+When every run is cached there is no I/O at all, so the structure is the entire
+cost. Six strategies, all verified to produce identical sorted output with a
+matching ID checksum (N = 64 M, k = 6, best of 3):
+
+| strategy | ms | M entries/s | vs heap |
+|---|---:|---:|---:|
+| `heap` — `std::push_heap`/`pop_heap` (the original) | 2347.6 | 27.3 | 1.00× |
+| `loser` — tournament tree, single-threaded | 913.1 | 70.1 | **2.57×** |
+| `cascade` — log₂k rounds of threaded `std::merge` | 849.3 | 75.4 | 2.76× |
+| **`partition`** — threaded loser trees over disjoint key ranges | **182.7** | **350.3** | **12.85×** |
+| `gpu_merge` — log₂k rounds of `thrust::merge` on device | 481.0 | 133.1 | 4.88× |
+| `gpu_sort` — one radix sort, ignoring sortedness | n/a | — | does not fit in VRAM |
+
+Four things worth drawing out:
+
+1. **The loser tree beats the binary heap ~2.6–3× at identical asymptotic
+   work.** Both do O(N log k) comparisons. The difference is entirely
+   mechanical: replaying one leaf to the root is a fixed `ceil(log2 k)`
+   comparisons with no container resize, no branch on heap size, and a
+   predictable access pattern, where `pop_heap`/`push_heap` sift in both
+   directions through a shifting array.
+2. **`partition` is flat in k** (~305–350 M entries/s from k=2 to k=32) because
+   the comparison work spreads across threads and the limit becomes memory
+   bandwidth: 350 M × 24 B × 2 ≈ **16.8 GB/s of traffic**, i.e. it is running
+   at the DDR5 roof. There is nothing left to win on the CPU.
+3. **`cascade` degrades as k grows** (114 → 51 M entries/s from k=2 to k=32),
+   exactly as predicted: it moves O(N log k) bytes instead of O(N). It is the
+   one strategy whose *asymptotics* are worse, and the measurement shows it.
+4. **The GPU merge was measured and rejected**, which is the most interesting
+   negative result here. See §16.3.
+
+### 16.3 Why merging does not belong on the GPU — and why sorting does
+
+`gpu_merge` is ~4.9× faster than the heap but **2.6× slower than the CPU's
+`partition`**, and this is not an implementation shortcoming. It follows
+directly from §2's operational-intensity argument, and it is the cleanest
+illustration of that argument in the whole project:
+
+- Input and output both live in RAM, so a GPU merge must cross PCIe **twice**.
+  At 13.3 GB/s (§12.3) that is a hard floor of `2N / 13.3 GB/s`.
+- The CPU can merge at the **DDR5 roof, ~16.8 GB/s** of traffic — *faster than
+  PCIe*. So the GPU is beaten before its kernel even starts.
+- The reason **sorting** survives the same tax is that it does far more work
+  per byte: a sort is ~log₂(n) ≈ 24 passes' worth of ordering work per element,
+  whereas a merge is only log₂(k) ≈ 3 comparisons per element. **Sorting has
+  roughly an order of magnitude more work per byte to amortise the transfer
+  against; merging does not.**
+
+> **The generalisable rule:** in an out-of-core pipeline, a phase belongs on
+> the GPU only when its work-per-byte exceeds the ratio of PCIe bandwidth to
+> host-memory bandwidth. Sorting clears that bar; merging does not. This is the
+> §2.2 roofline argument used *predictively* rather than as a post-hoc excuse,
+> and the measurement confirms it.
+
+### 16.4 The finding that dwarfed the algorithm: output allocation
+
+Every row in §16.2 merges into a buffer that is already allocated and already
+page-faulted, because the benchmark reuses `out` across trials. A real loader
+allocates the output fresh — and `std::vector::resize()` **value-initialises**,
+writing zeros over the whole buffer and faulting in every page on one thread
+before the merge can start.
+
+| N = 64 M, k = 6 | ms |
+|---|---:|
+| `partition` into a reused, pre-faulted buffer | **182.7** |
+| `partition` into a freshly `resize()`d vector | **843.1** |
+| — of which `resize()` zero-fill and faulting | **639** |
+
+**The allocation cost 3.5× the merge it was preparing for**, and it was
+invisible to every best-of-N benchmark. This is the same class of error as the
+pinned-buffer discovery in §12.3: *allocation is a first-class cost that scales
+with size, and reporting only steady-state throughput hides it.*
+
+The fix is a `default_init_allocator` (in
+[src/rect_rtree_format.h](src/rect_rtree_format.h)) that leaves trivially
+constructible elements uninitialised. `Entry` is trivially default
+constructible and every element is written before it is read, so this is safe.
+The zero-fill disappears and the pages are instead faulted in by the **12
+parallel merge threads that overwrite them**, rather than serially up front:
+
+**824 ms → 240 ms, a 3.4× improvement in Phase B with no change to the merge
+algorithm at all.** The same allocator was applied to the CPU loader's Phase A
+staging buffers (2 × 256 MB) and the page buffers.
+
+### 16.5 What was adopted, and what it bought on the real build
+
+[src/kway_merge.h](src/kway_merge.h) is now shared by both loaders:
+
+- **In-RAM runs** → `kway_merge_ram`: partitioned, threaded loser trees.
+  Boundaries are found by binary search on the 32-bit ordered key (for a
+  candidate `K`, count elements `< K` across all runs in O(k log n)), so the
+  output ranges are exactly disjoint and each thread writes to a known offset —
+  no locks, no atomics, no merging of partial results.
+- **Spilled runs** → `loser_merge_stream`: a templated streaming loser tree
+  over any cursor type. A partitioned merge is unavailable here because it
+  would need binary search *inside* each spilled file.
+
+Measured on the real 60 M build (not the microbenchmark):
+
+| Phase B implementation | merge | total build |
+|---|---:|---:|
+| binary heap (original) | 2365 ms | ~5.74 s |
+| loser tree, 1 thread | 1469 ms | 4.46 s |
+| + partitioned, 12 threads | 834 ms | 4.13 s |
+| **+ default-init allocator** | **242 ms** | **3.25 s** |
+
+**Phase B: 9.8× faster. End-to-end: ~5.74 s → 3.25 s, a 1.77× whole-build
+speedup.** All correctness tests still pass, including the in-RAM vs spilled
+equivalence check.
+
+---
+
+## 17. The CPU control group — an honest speedup at last
+
+[src/str_rtree_cpu.cpp](src/str_rtree_cpu.cpp) is a faithful twin of the GPU
+loader: identical phases, identical on-disk format, identical cached-run,
+merge (literally the same header) and double-buffered-I/O machinery. **Only
+the sort differs.** `--threads 1` is fully serial including the merge;
+`--threads N` uses a parallel merge sort (blocks sorted concurrently, then
+merged pairwise in log₂N threaded rounds).
+
+Runner: [bench/compare_gpu_cpu.sh](bench/compare_gpu_cpu.sh).
+
+| dataset | build | sort A | sort C | merge | **total** | vs CPU@1 |
+|---|---|---:|---:|---:|---:|---:|
+| 1 M | CPU ×1 | 88.5 | 61.7 | — | 0.23 s | 1.00× |
+| 1 M | CPU ×6 | 39.4 | 41.1 | — | 0.17 s | 1.35× |
+| 1 M | CPU ×12 | 38.6 | 59.9 | — | 0.19 s | 1.21× |
+| 1 M | **GPU** | **1.9** | **13.1** | — | **1.84 s** | **0.12×** |
+| 16 M | CPU ×1 | 1653 | 1125 | 272 | 3.76 s | 1.00× |
+| 16 M | CPU ×6 | 693 | 456 | 62 | 1.91 s | 1.97× |
+| 16 M | CPU ×12 | 717 | 539 | 59 | 2.05 s | 1.83× |
+| 16 M | **GPU** | **28** | **79** | 61 | **1.47 s** | **2.56×** |
+| 60 M | CPU ×1 | 6302 | 4429 | 1456 | 13.94 s | 1.00× |
+| 60 M | CPU ×6 | 2701 | 1866 | 325 | 6.61 s | 2.11× |
+| 60 M | CPU ×12 | 2765 | 1909 | 245 | 6.61 s | 2.11× |
+| 60 M | **GPU** | **104** | **197** | 245 | **4.71 s** | **2.96×** |
+
+### 17.1 The honest headline
+
+At 60 M rectangles, comparing **sorting only**:
+
+- GPU vs single-threaded CPU: 301 ms vs 10 731 ms = **35.7×**
+- GPU vs all-core CPU: 301 ms vs 4 674 ms = **15.5×**
+
+Comparing **end to end**:
+
+- GPU vs single-threaded CPU: **2.96×**
+- GPU vs all-core CPU: **1.40×**
+
+**Quote the 15.5× and the 1.40×, not the 35.7×.** The single-threaded baseline
+inflates the result by 2.3× and would be the first thing a reviewer attacks —
+which is exactly why §5.6 and §15.9 flagged its absence as blocking. It is now
+resolved.
+
+### 17.2 Amdahl's law is the real story
+
+The GPU sorts **15.5× faster than 12 CPU threads**, yet the build is only
+**1.40× faster**. Sorting fell from 71% of the CPU build's time to 6% of the
+GPU build's. Everything that remains — disk I/O, the merge, page packing,
+buffer allocation, CUDA context creation — is untouched by the GPU and now
+dominates completely.
+
+**This is the project's thesis arriving at its own limit.** Out-of-core
+bulk-loading is a data-movement problem, and once the one compute-heavy phase
+has been accelerated 15×, accelerating it further is worth almost nothing. The
+remaining wins are all in movement: overlapping the merge's reads, reusing
+buffers instead of reallocating them, and hiding PCIe behind the kernel.
+
+### 17.3 The GPU is a net loss below a few million rectangles
+
+At 1 M rectangles the GPU build takes **1.84 s against the CPU's 0.19 s — it is
+8× slower.** The sorts themselves are 5–20× faster (1.9 ms vs 38.6 ms); the
+entire deficit is the ~1.7 s cold CUDA context creation of §12.5, which the
+CPU never pays.
+
+The loader already reports `GPU init` on its own line, so this is visible
+rather than hidden — but it means **there is a dataset size below which this
+project's entire premise does not apply**, and on this hardware it is somewhere
+in the low millions of rectangles. A production loader should dispatch to the
+CPU path below that threshold, exactly as `sort_entries` already dispatches per
+sort.
+
+### 17.4 SMT does not help
+
+CPU ×6 and CPU ×12 are indistinguishable (6.61 s both at 60 M), and the ×12
+sort is marginally *slower* than ×6 (2765 ms vs 2701 ms). The machine has 6
+physical cores and 12 hardware threads; this workload is memory-bandwidth-bound
+(§2.2), so the second thread per core has nothing to contend for but bandwidth
+that is already saturated. **Use physical cores, not hardware threads, for
+sizing.**
+
+### 17.5 What this changes about the earlier open questions
+
+| Open question | Status |
+|---|---|
+| §9, §15.9 — no CPU control group, every ratio is an upper bound | **Resolved.** 15.5× sort, 1.40× end-to-end against an all-core baseline. |
+| §13 — the merge is the biggest remaining cost | **Resolved.** 9.8× faster; it is now 5% of the build. |
+| §3.3 — a spilled merge is I/O-bound so the algorithm is irrelevant | **Refuted.** It costs 4–6× the cold-cache I/O floor because reads are synchronous. |
+| §13 — should the merge go on the GPU? | **Answered: no**, on measurement and on theory (§16.3). |
+
+### 17.6 Still open
+
+1. **Overlap the spilled merge's reads.** §16.1 shows the disk merge costs
+   `I/O + CPU` because `refill()` blocks. Double-buffering each reader would
+   make it `max(I/O, CPU)` — worth roughly 2× in the spill regime, which is
+   the regime the whole project exists for.
+2. **Reuse buffers across phases.** §16.4 removed the merge's allocation cost;
+   Phase A still allocates and frees ~512 MB of pinned staging that Phase C
+   then re-allocates.
+3. **CUDA streams** to overlap H2D/D2H with the kernel — now the single
+   largest remaining GPU-side item, worth up to 70% of GPU time (§12.1).
+4. **A size threshold for GPU dispatch**, per §17.3.
+5. **A genuine larger-than-RAM run** — still owed (§15.9).

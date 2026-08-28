@@ -30,7 +30,8 @@ CXXFLAGS  := -O3 -std=c++17
 .PHONY: all
 all: $(BIN_DIR)/external_str $(BIN_DIR)/external_str_cpu $(BIN_DIR)/rtree_query \
      $(BIN_DIR)/gen_points $(BIN_DIR)/gpu_info \
-     $(BIN_DIR)/str_rtree $(BIN_DIR)/rect_rtree_query $(BIN_DIR)/gen_rects
+     $(BIN_DIR)/str_rtree $(BIN_DIR)/str_rtree_cpu \
+     $(BIN_DIR)/rect_rtree_query $(BIN_DIR)/gen_rects
 
 # ----------------------------------------------------------------
 # Binaries
@@ -51,10 +52,14 @@ $(BIN_DIR)/gpu_info: $(SRC_DIR)/gpu_info.cu
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
 # ---- textbook-layout STR R-Tree over rectangles (refactor/the-return-of-the-programer)
-RECT_HDRS := $(SRC_DIR)/rect_constants.h $(SRC_DIR)/rect_rtree_format.h
+RECT_HDRS := $(SRC_DIR)/rect_constants.h $(SRC_DIR)/rect_rtree_format.h \
+             $(SRC_DIR)/kway_merge.h
 
 $(BIN_DIR)/str_rtree: $(SRC_DIR)/str_rtree_cuda.cu $(RECT_HDRS)
 	$(NVCC) $(NVCCFLAGS) $< -o $@
+
+$(BIN_DIR)/str_rtree_cpu: $(SRC_DIR)/str_rtree_cpu.cpp $(RECT_HDRS)
+	$(CXX) $(CXXFLAGS) -pthread $< -o $@
 
 $(BIN_DIR)/rect_rtree_query: $(SRC_DIR)/rect_rtree_query.cpp $(RECT_HDRS)
 	$(CXX) $(CXXFLAGS) $< -o $@
@@ -68,7 +73,8 @@ $(BIN_DIR)/gen_rects: $(SRC_DIR)/gen_rects.cpp $(RECT_HDRS)
 BENCH_DIR := bench
 
 .PHONY: bench
-bench: $(BIN_DIR)/bench_sort_crossover $(BIN_DIR)/bench_pinned_memory $(BIN_DIR)/bench_context_init
+bench: $(BIN_DIR)/bench_sort_crossover $(BIN_DIR)/bench_pinned_memory \
+       $(BIN_DIR)/bench_context_init $(BIN_DIR)/bench_kway_merge
 
 $(BIN_DIR)/bench_sort_crossover: $(BENCH_DIR)/bench_sort_crossover.cu $(RECT_HDRS)
 	$(NVCC) $(NVCCFLAGS) -I$(SRC_DIR) $< -o $@
@@ -79,6 +85,9 @@ $(BIN_DIR)/bench_pinned_memory: $(BENCH_DIR)/bench_pinned_memory.cu
 $(BIN_DIR)/bench_context_init: $(BENCH_DIR)/bench_context_init.cu
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
+$(BIN_DIR)/bench_kway_merge: $(BENCH_DIR)/bench_kway_merge.cu $(RECT_HDRS)
+	$(NVCC) $(NVCCFLAGS) -I$(SRC_DIR) -Xcompiler -pthread $< -o $@
+
 # ----------------------------------------------------------------
 # Utility targets
 # ----------------------------------------------------------------
@@ -88,7 +97,8 @@ $(BIN_DIR)/bench_context_init: $(BENCH_DIR)/bench_context_init.cu
 clean:
 	rm -f $(BIN_DIR)/external_str $(BIN_DIR)/external_str_cpu $(BIN_DIR)/rtree_query \
 	      $(BIN_DIR)/gen_points $(BIN_DIR)/gpu_info \
-	      $(BIN_DIR)/str_rtree $(BIN_DIR)/rect_rtree_query $(BIN_DIR)/gen_rects \
+	      $(BIN_DIR)/str_rtree $(BIN_DIR)/str_rtree_cpu \
+     $(BIN_DIR)/rect_rtree_query $(BIN_DIR)/gen_rects \
 	      $(BIN_DIR)/bench_sort_crossover $(BIN_DIR)/bench_pinned_memory \
 	      $(BIN_DIR)/bench_context_init
 
@@ -126,7 +136,8 @@ help:
 	@echo ""
 	@echo "Rectangle R-Tree (textbook node layout):"
 	@echo "  ./bin/gen_rects <N> [out.bin] [--clustered K]"
-	@echo "  ./bin/str_rtree data/rects.bin data/tree.bin [--fill-leaf F] [--fill-internal F]"
+	@echo "  ./bin/str_rtree     data/rects.bin data/tree.bin [--fill-leaf F] [--merge-threads N]"
+	@echo "  ./bin/str_rtree_cpu data/rects.bin data/tree.bin --threads N   (CPU control group)"
 	@echo "  ./bin/rect_rtree_query data/tree.bin verify data/rects.bin"
 	@echo "  ./bin/rect_rtree_query data/tree.bin bench  data/rects.bin 0.01 20"
 	@echo ""
@@ -136,5 +147,7 @@ help:
 	@echo "  ./bin/bench_pinned_memory 3       Pinned alloc cost vs H2D bandwidth"
 	@echo "  ./bin/bench_context_init          CUDA start-up cost (run cold, then warm)"
 	@echo "  ./bench/sweep_pinned_cap.sh <input.bin>"
+	@echo "  ./bin/bench_kway_merge --n 16 64 --k 4 16 --disk"
+	@echo "  ./bench/compare_gpu_cpu.sh data/rects.bin   GPU vs CPU control group"
 	@echo "  ./bench/test_correctness.sh [N]   Full correctness matrix"
 	@echo ""
