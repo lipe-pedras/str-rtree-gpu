@@ -58,6 +58,7 @@
 #include <array>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/vfs.h>
 #include <limits>
 
 #include "rect_rtree_format.h"
@@ -383,6 +384,19 @@ static void fsync_path(const std::string& path) {
     ::close(fd);
 }
 
+// A RAM-backed filesystem has no device behind it, so posix_fadvise cannot
+// evict anything and every "cold" number would silently be a memory
+// measurement.  This bit us once already: an early verification run reported
+// 100% residency after eviction purely because the test file was under /tmp,
+// which is tmpfs on this machine.  Refuse to report disk figures in that case.
+static bool dir_is_ram_backed(const char* dir) {
+    struct statfs sf;
+    if (statfs(dir, &sf) != 0) return false;
+    constexpr long TMPFS_MAGIC  = 0x01021994;
+    constexpr long RAMFS_MAGIC  = 0x858458f6;
+    return sf.f_type == TMPFS_MAGIC || sf.f_type == RAMFS_MAGIC;
+}
+
 static void evict(const std::string& path) {
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return;
@@ -475,6 +489,15 @@ static void disk_regime(size_t total, size_t k, int /*threads*/) {
            total / 1000000, k, gb / 2, gb / 2, gb);
 
     std::filesystem::create_directories("tmp");
+
+    if (dir_is_ram_backed("tmp")) {
+        printf("  SKIPPED: ./tmp is a RAM-backed filesystem (tmpfs/ramfs).\n"
+               "  posix_fadvise cannot evict pages that have no device behind\n"
+               "  them, so every figure here would measure memory, not disk.\n"
+               "  Point ./tmp at a real block device and re-run.\n");
+        return;
+    }
+
     std::mt19937 rng(11);
     std::uniform_real_distribution<float> u(0, 1000);
 
