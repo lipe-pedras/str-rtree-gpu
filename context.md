@@ -1081,7 +1081,11 @@ Pinned buffers, 24-byte `Entry`; GPU column includes H2D + key build + radix
 Two results here, both article-worthy:
 
 1. **The crossover is at ~8 Ki entries** — three orders of magnitude below the
-   1 Mi that was assumed when the constant was first written. Once data is
+   1 Mi that was assumed when the constant was first written. It is a *band*
+   rather than a point: repeat runs with fewer trials place it anywhere from
+   4 Ki to 16 Ki, since at that size both arms take microseconds and scheduler
+   noise is comparable to the signal. Any value in that band is defensible; the
+   original 1 Mi is not. Once data is
    already in a pinned buffer, even a small sort is worth shipping to the GPU.
    The first version of the rewrite guessed 1 Mi and thereby made Phase C
    **3× slower** (62 ms of `std::sort` where 20 ms of GPU would do). *Guessing
@@ -1412,8 +1416,12 @@ artefact of one size), and the bandwidth column varies by less than 0.6% (so
 the flat-bandwidth claim is not noise).
 
 **Known weakness.** Best-of-3 in a quiet system. The single-trial numbers taken
-under memory pressure were ~2× higher (§12.3). Both are reported; a proper
-treatment would sweep system memory pressure as a second variable.
+under memory pressure were ~2× higher (§12.3), and a later single-trial run
+immediately after a cold CUDA context init measured **1.66 ms/MB**, over 3× the
+quiet figure. Both extremes are real; the honest statement is a range of
+**0.53–1.7 ms/MB depending on system state**, with the linearity in size — the
+part the design decision rests on — holding throughout. A proper treatment
+would sweep memory pressure as a second variable.
 
 ### 15.4 CUDA context initialisation (§12.5)
 
@@ -1779,12 +1787,20 @@ At 1 M rectangles the GPU build takes **1.84 s against the CPU's 0.19 s — it i
 entire deficit is the ~1.7 s cold CUDA context creation of §12.5, which the
 CPU never pays.
 
+**The measured crossover is between 8 M and 16 M rectangles** — higher than
+"the low millions" that an earlier draft of this section guessed:
+
+| N | GPU | CPU ×1 | CPU ×6 | verdict |
+|---:|---:|---:|---:|---|
+| 1 M | 1.84 s | 0.19 s | 0.17 s | GPU loses by ~10× |
+| 8 M | 2.03 s | 1.75 s | 1.28 s | GPU still loses |
+| 16 M | 1.47 s | 3.76 s | 1.91 s | GPU wins |
+
 The loader already reports `GPU init` on its own line, so this is visible
 rather than hidden — but it means **there is a dataset size below which this
-project's entire premise does not apply**, and on this hardware it is somewhere
-in the low millions of rectangles. A production loader should dispatch to the
-CPU path below that threshold, exactly as `sort_entries` already dispatches per
-sort.
+project's entire premise does not apply**, and on this hardware it is around
+10 M rectangles (240 MB). A production loader should dispatch to the CPU path
+below that threshold, exactly as `sort_entries` already dispatches per sort.
 
 ### 17.4 SMT does not help
 
