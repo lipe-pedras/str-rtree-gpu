@@ -1817,3 +1817,108 @@ sizing.**
    largest remaining GPU-side item, worth up to 70% of GPU time (§12.1).
 4. **A size threshold for GPU dispatch**, per §17.3.
 5. **A genuine larger-than-RAM run** — still owed (§15.9).
+
+
+---
+
+## 18. The genuinely larger-than-RAM run
+
+Every previous result was in a regime where the dataset fit in the 5 GB RAM
+budget, so runs stayed cached and Phase B never touched the disk. The spill
+path was verified only with artificially shrunken budgets (§12.8). **This is
+the first build where the data genuinely does not fit**, and it is the regime
+the whole project was written for.
+
+**300,000,000 rectangles = 7.2 GB of input against a 5 GB RAM budget and
+2.94 GB of usable VRAM.** The runs must spill; the merge must go through disk.
+
+### 18.1 It works, and it is correct
+
+| | |
+|---|---|
+| Input | 7.20 GB, 300 M rectangles |
+| Runs | **27, all spilled to disk** (RAM budget exhausted) |
+| Merged data | on disk |
+| Output tree | 6.93 GB, **1,775,150 pages**, height 4 |
+| Predicted pages / height | 1,775,150 / 4 — **exact match** |
+| Verification | **VERIFY OK** — 300,000,000 / 300,000,000 objects indexed exactly once, **100.00% leaf occupancy**, every parent MBR contains its subtree, 1000 sampled rectangles round-trip |
+| Wall clock | **54.5–59.9 s** |
+
+The closed-form `precompute_num_nodes` matched the walked page count exactly at
+a scale where nothing about the code path resembles the in-RAM case. That is
+the strongest correctness evidence in the project.
+
+### 18.2 Where the time goes — and it is not the GPU
+
+Detailed breakdown of one 59.9 s build:
+
+| component | time | share |
+|---|---:|---:|
+| **Disk read** | 22 812 ms (678 MB/s over 15.5 GB) | **38%** |
+| **CPU merge** (spilled: streaming loser tree) | 20 729 ms | **35%** |
+| Disk write | 8 772 ms (2 558 MB/s over 21.9 GB) | 15% |
+| Buffer / RAM-cache | 8 948 ms | 15% |
+| Pack + MBR | 1 919 ms | 3% |
+| **GPU sort** | **1 463 ms** | **2.4%** |
+| H2D transfer | 1 239 ms | 2% |
+| component sum / wall | 67 202 / 59 899 ms | overlap saved **7 303 ms** |
+
+**The GPU sort is 2.4% of the build.** Everything else is moving bytes.
+
+### 18.3 The control group at true out-of-core scale
+
+| build | sort A | sort C | merge | **total** | vs CPU×1 |
+|---|---:|---:|---:|---:|---:|
+| CPU ×1 | 36 418 | 57 319 | 12 459 | 121.41 s | 1.00× |
+| CPU ×6 | 15 458 | 22 268 | 14 839 | **76.81 s** | 1.58× |
+| CPU ×12 | 17 064 | 21 145 | 16 944 | 78.39 s | 1.55× |
+| **GPU** | **528** | **882** | 16 429 | **54.54 s** | **2.23×** |
+
+**Sorting only:** GPU 1 410 ms vs CPU×12 38 209 ms = **27.1×**
+(vs CPU×1 93 737 ms = 66.5×, the number not to quote).
+
+**End to end:** GPU vs CPU×12 = **1.44×**.
+
+Sorting is **49%** of the all-core CPU build and **2.6%** of the GPU build.
+SMT again buys nothing — CPU×6 beats CPU×12.
+
+### 18.4 What this settles
+
+> **The GPU does its one job 27× faster and the whole build gets 1.44× faster.**
+
+That single sentence is the honest summary of this project. It is Amdahl's law
+applied to an out-of-core pipeline, and it holds *more* strongly at real scale
+than it did in RAM (§17.2, where the same figures were 15.5× and 1.40×): the
+larger the dataset, the better the GPU sorts relative to the CPU, and the less
+that matters to the total.
+
+Two consequences worth stating plainly in any write-up:
+
+1. **The premise is validated but the payoff is bounded.** Building an R-Tree
+   over data that fits in neither VRAM nor RAM is entirely feasible on a 4 GB
+   laptop GPU — 300 M rectangles in under a minute, fully verified. But the
+   speedup a GPU buys is set by how much of the pipeline is sorting, and in the
+   out-of-core regime that is a small and *shrinking* fraction.
+2. **The remaining bottlenecks are both fixable and both about movement.** The
+   spilled merge (35%) is single-threaded because the partitioned merge of
+   §16.5 needs random access into runs, which spilled files do not offer; and
+   its reads are synchronous (§16.1), so it pays `I/O + CPU` instead of
+   `max(I/O, CPU)`. Disk read (38%) runs at only 419–678 MB/s against the
+   1.8–1.9 GB/s the device demonstrates on a clean sequential copy, because
+   Phase C alternates reads of the merged file with writes of the tree on one
+   I/O thread — the §3.2 lesson (one sequential stream per device) reappearing
+   in a case where two streams are structurally unavoidable.
+
+*(Variance note: the total ranged 54.5–59.9 s across runs, and the merge
+12.5–16.9 s, because I/O contends with page-cache pressure at this size. The
+component shares are stable; the absolute totals should be read as ±10%.)*
+
+### 18.5 Open questions, updated
+
+| Item | Status |
+|---|---|
+| §15.9, §17.6 — no genuine larger-than-RAM run | **Resolved.** 300 M rectangles, 27 spilled runs, VERIFY OK. |
+| §3.1 — the three-regime disk-traffic table | **Confirmed for all three regimes.** Regime 3 measured: 15.5 GB read, 21.9 GB written for a 7.2 GB input. |
+| Prefetch the spilled merge's reads | **Now the top priority** — 35% of the build, and the fix is known (§16.1). |
+| Phase C read/write interleaving | **New.** 419–678 MB/s against a 1.8 GB/s device floor. |
+| CUDA streams, buffer reuse, skewed data | Still open, but §18.2 shows they target 2.4%, 15% and 0% of the build respectively — only buffer reuse is now worth the effort. |
