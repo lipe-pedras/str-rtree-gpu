@@ -22,14 +22,19 @@ shift || true
 CAPS=("$@"); [ ${#CAPS[@]} -eq 0 ] && CAPS=(64 128 256 512 1024)
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
-cp src/rect_rtree_format.h src/str_rtree_cuda.cu "$WORK/"
+# Copy every header the loader includes, not a hand-listed subset: a missing
+# one makes nvcc fail and (with stderr silenced) the test silently reports an
+# empty result instead of a failure.
+cp src/*.h src/str_rtree_cuda.cu "$WORK/"
 
 printf "%10s %6s %12s %12s %12s %10s\n" "cap(MB)" "runs" "phaseA(ms)" "merge(ms)" "phaseC(ms)" "total(s)"
 for mb in "${CAPS[@]}"; do
   bytes=$(( mb * 1048576 ))
   sed "s/^constexpr size_t MAX_PINNED_CHUNK_BYTES = .*/constexpr size_t MAX_PINNED_CHUNK_BYTES = ${bytes}ULL;/" \
       src/rect_constants.h > "$WORK/rect_constants.h"
-  nvcc -O3 -std=c++17 -arch=sm_86 -I"$WORK" "$WORK/str_rtree_cuda.cu" -o "$WORK/sweep" 2>/dev/null
+  if ! nvcc -O3 -std=c++17 -arch=sm_86 -I"$WORK" "$WORK/str_rtree_cuda.cu" -o "$WORK/sweep"; then
+    echo "FAILED to build at cap ${mb} MB"; exit 1
+  fi
   out=$("$WORK/sweep" "$INPUT" "$WORK/tree.bin" 2>/dev/null)
   printf "%10s %6s %12s %12s %12s %10s\n" "$mb" \
     "$(echo "$out" | grep 'Runs:'            | awk '{print $2}')" \

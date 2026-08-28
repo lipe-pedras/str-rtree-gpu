@@ -38,13 +38,18 @@ note "clustered (50 gaussian clusters)" \
 
 # Forced external path: shrink the budgets so runs must spill to disk.
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
-cp src/rect_rtree_format.h src/str_rtree_cuda.cu "$WORK/"
+# Copy every header the loader includes, not a hand-listed subset: a missing
+# one makes nvcc fail and (with stderr silenced) the test silently reports an
+# empty result instead of a failure.
+cp src/*.h src/str_rtree_cuda.cu "$WORK/"
 sed -e 's/^constexpr size_t USABLE_GPU_BYTES = .*/constexpr size_t USABLE_GPU_BYTES = 8388608ULL;/' \
     -e 's/^constexpr size_t USABLE_RAM_BYTES = .*/constexpr size_t USABLE_RAM_BYTES = 2097152ULL;/' \
     -e 's/^constexpr size_t MAX_PINNED_CHUNK_BYTES = .*/constexpr size_t MAX_PINNED_CHUNK_BYTES = 4194304ULL;/' \
     -e 's/^constexpr size_t PHASE_LEAF_HOST_BYTES = .*/constexpr size_t PHASE_LEAF_HOST_BYTES = 4194304ULL;/' \
     src/rect_constants.h > "$WORK/rect_constants.h"
-nvcc -O3 -std=c++17 -arch=sm_86 -I"$WORK" "$WORK/str_rtree_cuda.cu" -o "$WORK/tiny" 2>/dev/null
+if ! nvcc -O3 -std=c++17 -arch=sm_86 -I"$WORK" "$WORK/str_rtree_cuda.cu" -o "$WORK/tiny"; then
+  echo "FAILED to build the reduced-budget loader; cannot test the spill path"; exit 1
+fi
 ./bin/str_rtree data/t_uni.bin data/t_ram.bin >/dev/null 2>&1
 "$WORK/tiny" data/t_uni.bin data/t_ext.bin >/dev/null 2>&1
 note "forced disk spill (8 MB GPU / 2 MB RAM budget)" \
