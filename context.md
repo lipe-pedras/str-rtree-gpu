@@ -1938,3 +1938,117 @@ component shares are stable; the absolute totals should be read as ±10%.)*
 | Prefetch the spilled merge's reads | **Now the top priority** — 35% of the build, and the fix is known (§16.1). |
 | Phase C read/write interleaving | **New.** 419–678 MB/s against a 1.8 GB/s device floor. |
 | CUDA streams, buffer reuse, skewed data | Still open, but §18.2 shows they target 2.4%, 15% and 0% of the build respectively — only buffer reuse is now worth the effort. |
+
+
+---
+
+## 19. Definitive results — re-measured on mains power, performance governor
+
+Everything in §12–§18 was measured on **battery**, with the CPU frequency
+governor throttling to 28–65% of nominal (§15.1 flagged this as uncontrolled).
+The full suite was re-run with the machine on **AC power, `performance`
+governor, GPU boosting at 1740/2100 MHz**. **These are the numbers to cite.**
+
+The direction of the change is itself informative: the bandwidth-bound
+microbenchmarks barely moved, while every CPU-bound measurement improved
+sharply. That is a second, independent confirmation of §2's central claim that
+this workload is limited by data movement rather than by computation.
+
+### 19.1 Unchanged (hardware-limited, not clock-limited)
+
+| measurement | battery | AC / performance |
+|---|---|---|
+| CUDA context creation, cold / warm | 1717 / 174 ms | **1728 / 126 ms** |
+| Pinned allocation | 0.526–0.544 ms/MB | **0.505–0.521 ms/MB** |
+| H2D bandwidth (64 MB → 1350 MB) | 13.33–13.40 GB/s | **13.04–13.34 GB/s** |
+| GPU/CPU sort crossover | ~8 Ki entries | **~8 Ki entries** (4–16 Ki band) |
+| GPU sort speedup at 16.7 M | 21.0× | **20.0×** |
+
+PCIe and pinned-page cost are properties of the link and the MMU; the governor
+cannot touch them.
+
+### 19.2 Improved (CPU-bound)
+
+**In-RAM k-way merge** (N = 64 M, k = 16): partition reaches **373.7 M
+entries/s, 12.1× the binary heap** (battery: 268.6 M, 9.8×). Loser tree 2.8×,
+cascade 2.0×, GPU merge 5.0× — the ranking is unchanged, and the GPU merge is
+still **2.3× slower than the CPU's partitioned merge**, confirming §16.3.
+
+**Spilled merge vs the cold-cache I/O floor**: the merge now costs **2.45–2.71×
+the floor** (battery: 4.6–5.8×), with the floor itself at 1.88–1.94 GB/s. The
+§16.1 conclusion stands — a spilled merge is *not* I/O-bound — but the margin is
+smaller than battery measurements suggested. Loser tree vs heap on spilled runs
+is **within noise** (1.18× at 16 M, 0.95× at 64 M); only the in-RAM result is
+solid.
+
+### 19.3 The two headline comparisons
+
+**60 M rectangles (fits in RAM):**
+
+| build | sort A | sort C | merge | **total** |
+|---|---:|---:|---:|---:|
+| CPU ×1 | 6086 | 4341 | 1382 | 13.72 s |
+| CPU ×6 | 2601 | 1715 | 307 | **6.32 s** |
+| CPU ×12 | 2589 | 1834 | 207 | 6.32 s |
+| **GPU** | **99** | **180** | 220 | **3.43 s** |
+
+Sorting: GPU 279 ms vs CPU×6 4316 ms = **15.5×**. End to end: **1.84×**.
+
+**300 M rectangles (7.2 GB — exceeds the 5 GB RAM budget; 27 runs spill):**
+
+| build | sort A | sort C | merge | **total** |
+|---|---:|---:|---:|---:|
+| CPU ×1 | 30 662 | 23 134 | 8 783 | 82.04 s |
+| CPU ×6 | 13 307 | 8 404 | 10 420 | **50.81 s** |
+| CPU ×12 | 13 476 | 9 304 | 13 755 | 56.65 s |
+| **GPU** | **491** | **715** | 11 892 | **39.70 s** |
+
+Sorting: GPU 1 206 ms vs CPU×6 21 712 ms = **18.0×**. End to end: **1.28×**.
+Sorting is **42.7%** of the all-core CPU build and **3.0%** of the GPU build.
+
+The out-of-core build now completes in **40.75 s** (battery: 54.5–59.9 s), with
+`VERIFY OK`: 300 000 000 / 300 000 000 objects indexed exactly once, 100.00%
+leaf occupancy, 1 775 150 pages and height 4 matching the closed form exactly.
+
+Component breakdown of that build: disk read 23 330 ms (663 MB/s), CPU merge
+11 655 ms, disk write 4 974 ms (4 512 MB/s), buffers 3 082 ms, pack 1 534 ms,
+**GPU sort 1 219 ms**, H2D 1 133 ms, D2H 1 147 ms. Component sum 48 090 ms
+against a 40 746 ms wall — **7 345 ms saved by GPU ‖ I/O overlap**.
+
+### 19.4 Query quality on the 300 M tree
+
+| selectivity | pages read | MBR tests | **tests per page** | time |
+|---:|---:|---:|---:|---:|
+| 0.0001% | 220.1 | 37 303 | **169.51** | 18.88 ms |
+| 0.001% | 314.3 | 53 329 | **169.66** | 8.80 ms |
+| 0.01% | 726.8 | 123 448 | **169.85** | 36.22 ms |
+| 0.1% | 3 139.2 | 533 556 | **169.97** | 208.97 ms |
+| 1% | 21 895.3 | 3 722 099 | **170.00** | 1 497.04 ms |
+
+**169.5–170.0 pruning decisions per page fetch against a theoretical ceiling of
+170** — the textbook node layout saturates it, versus the 128 ceiling the
+self-MBR layout imposed (§4.5). Against a brute-force scan at 0.01%
+selectivity: identical result counts, **8 386× faster** (0.40 ms vs 3 393.67 ms).
+
+Unlike §12.6, these timings are *not* warm-cache — the tree is 6.9 GB on a
+14 GB machine, so the small-selectivity times are dominated by cold page
+faults and are noisy. The `tests per page` column, being a count rather than a
+duration, is unaffected.
+
+### 19.5 The GPU-loss threshold moved
+
+| N | GPU | CPU ×1 | CPU ×6 | verdict |
+|---:|---:|---:|---:|---|
+| 1 M | 0.31 s | 0.21 s | 0.14 s | GPU loses ~2× |
+| 8 M | 0.94 s | 1.75 s | 0.91 s | **tie with all-core CPU** |
+| 16 M | 1.64 s | 3.87 s | 1.83 s | GPU wins |
+
+The break-even against an all-core CPU is now **≈ 8 M rectangles (190 MB)**,
+down from 8–16 M on battery (§17.3), because the fixed CUDA start-up cost is
+unchanged while everything the CPU does got faster.
+
+### 19.6 Correctness, re-verified
+
+All configurations pass on AC exactly as on battery: four fill factors,
+clustered data, the forced-spill path, in-RAM vs spilled query equivalence, and
+the 300 M out-of-core build. **ALL CORRECTNESS TESTS PASSED.**
