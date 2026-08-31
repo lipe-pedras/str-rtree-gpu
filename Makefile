@@ -18,6 +18,10 @@ SRC_DIR  := src
 BIN_DIR  := bin
 DATA_DIR := data
 TMP_DIR  := tmp
+ANIM_DIR := animation
+
+MANIM_VENV := $(HOME)/.venvs/manim
+MANIM_Q    := h        # l = fast draft, h = 1080p60; override: make render MANIM_Q=l
 
 NVCC      := nvcc
 CXX       := g++
@@ -89,9 +93,28 @@ $(BIN_DIR)/bench_kway_merge: $(BENCH_DIR)/bench_kway_merge.cu $(RECT_HDRS)
 	$(NVCC) $(NVCCFLAGS) -I$(SRC_DIR) -Xcompiler -pthread $< -o $@
 
 # ----------------------------------------------------------------
+# Animation (see animation/README.md)
+# ----------------------------------------------------------------
+
+# Builds a deliberately tiny tree with the REAL binaries, checks the Python
+# reference in str_reference.py against it page by page, and only then renders.
+# The animation can therefore never show an algorithm the code does not run.
+.PHONY: render
+render: $(BIN_DIR)/gen_rects $(BIN_DIR)/str_rtree
+	@mkdir -p $(ANIM_DIR)/data
+	$(BIN_DIR)/gen_rects 60 $(ANIM_DIR)/data/rects60.bin \
+	    --extent 100 --min-size 1 --max-size 3
+	$(BIN_DIR)/str_rtree $(ANIM_DIR)/data/rects60.bin $(ANIM_DIR)/data/tree60.bin \
+	    --fill-leaf 0.03 --fill-internal 0.03
+	. $(MANIM_VENV)/bin/activate && \
+	  python $(ANIM_DIR)/str_reference.py --validate $(ANIM_DIR)/data/tree60.bin && \
+	  manim -q$(MANIM_Q) --media_dir $(ANIM_DIR)/media \
+	        $(ANIM_DIR)/str_animation.py STRAlgorithm
+
+# ----------------------------------------------------------------
 # Utility targets
 # ----------------------------------------------------------------
-.PHONY: clean clean-tmp clean-data help
+.PHONY: clean clean-tmp clean-data clean-anim help
 
 # Remove compiled binaries (keeps directories)
 clean:
@@ -109,6 +132,11 @@ clean-tmp:
 # Remove dataset files in data/
 clean-data:
 	find $(DATA_DIR) -name "*.bin" | xargs rm -f
+
+# Remove rendered video and the animation's generated dataset
+clean-anim:
+	rm -rf $(ANIM_DIR)/media
+	find $(ANIM_DIR)/data -name "*.bin" -delete 2>/dev/null || true
 
 view:
 	python3 src/rtree_viewer.py data/rtree.bin
@@ -150,4 +178,9 @@ help:
 	@echo "  ./bin/bench_kway_merge --n 16 64 --k 4 16 --disk"
 	@echo "  ./bench/compare_gpu_cpu.sh data/rects.bin   GPU vs CPU control group"
 	@echo "  ./bench/test_correctness.sh [N]   Full correctness matrix"
+	@echo ""
+	@echo "Animation:"
+	@echo "  make render                       Render the STR animation to animation/media"
+	@echo "  make render MANIM_Q=l             Fast draft render"
+	@echo "  make clean-anim                   Remove the rendered video and its dataset"
 	@echo ""
