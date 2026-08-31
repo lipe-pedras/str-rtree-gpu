@@ -6,7 +6,7 @@ Nome do(a) estudante (IC), Nome do(a) orientador(a)
 
 RESUMO
 
-Índices espaciais R-Tree são essenciais para consultas geográficas, mas custosos de construir em grandes volumes. A literatura de construção em GPU assume que os dados cabem na memória do dispositivo — hipótese frágil, pois essa é a memória mais cara e escassa da máquina. Implementou-se o algoritmo Sort-Tile-Recursive em GPU para conjuntos maiores que ambas as memórias. Para 300 milhões de retângulos (7,2 GB), o índice foi construído e validado em 40,7 s, com ordenação 18 vezes mais rápida que na CPU, embora o ganho total fosse de 1,28 vez.
+Índices espaciais R-Tree são essenciais para consultas geográficas, mas custosos de construir em grandes volumes. A literatura de construção em GPU assume que os dados cabem na memória do dispositivo, cuja capacidade é tipicamente menor que a da memória principal. Implementou-se o algoritmo Sort-Tile-Recursive em GPU para conjuntos que excedem ambas as memórias. Para 300 milhões de retângulos (7,2 GB), o índice foi construído e validado em 40,7 s, com ordenação 18 vezes mais rápida que na CPU, embora o ganho total fosse de 1,28 vez.
 
 Palavras-chave: Índices espaciais. R-Tree. GPU. Processamento fora do núcleo. Bancos de dados.
 
@@ -20,7 +20,7 @@ INTRODUÇÃO
 
 O volume de dados espaciais cresce mais rápido que a memória disponível para processá-los. A R-Tree é a estrutura de indexação mais usada para consultas por região, mas construí-la sobre bilhões de objetos é caro. A construção em lote (bulk loading) resolve isso ordenando os dados e empacotando as folhas diretamente, o que torna o problema dominado por ordenação — operação em que a GPU é notoriamente eficiente.
 
-Toda a literatura consultada, porém, pressupõe que o conjunto de dados já resida na memória global da GPU. Essa hipótese é explicitada em Luo et al. (2012) e os experimentos das demais obras usam de 10⁵ a 10⁶ objetos. Como a memória de vídeo é o recurso mais caro e de menor capacidade do computador, tal pressuposto exclui justamente os casos de interesse prático. O objetivo deste trabalho é responder: dado que os dados não cabem na GPU, qual é a melhor forma de utilizá-la?
+Toda a literatura consultada, porém, pressupõe que o conjunto de dados já resida na memória global da GPU: Luo et al. (2012) explicitam a hipótese, e os experimentos das demais obras empregam de 10⁵ a 10⁶ objetos. Como as GPUs dispõem geralmente de menos memória que os sistemas hospedeiros, a escalabilidade dessas abordagens é limitada (SHAHI, 2025), o que deixa de fora conjuntos de interesse prático. O objetivo deste trabalho é responder: dado que os dados não cabem na GPU, qual é a melhor forma de utilizá-la?
 
 REFERENCIAL TEÓRICO
 
@@ -55,6 +55,8 @@ REFERÊNCIAS
 GUTTMAN, Antonin. R-trees: a dynamic index structure for spatial searching. In: ACM SIGMOD INTERNATIONAL CONFERENCE ON MANAGEMENT OF DATA, 1984, Boston. Proceedings [...]. New York: ACM, 1984. p. 47-57.
 
 LEUTENEGGER, Scott T.; EDGINGTON, Jeffrey M.; LOPEZ, Mario A. STR: a simple and efficient algorithm for R-tree packing. Hampton: ICASE, 1997. (ICASE Report No. 97-14; NASA Contractor Report 201661).
+
+SHAHI, Nirmal. Optimization of R-tree construction for spatial data using GPU. 2025. Dissertação (Mestrado em Ciência da Computação) – Southern Illinois University Edwardsville, Edwardsville, 2025.
 
 LUO, Lijuan; WONG, Martin D. F.; LEONG, Lance. Parallel implementation of R-trees on the GPU. In: ASIA AND SOUTH PACIFIC DESIGN AUTOMATION CONFERENCE, 17., 2012, Sydney. Proceedings [...]. Piscataway: IEEE, 2012. p. 353-358.
 
