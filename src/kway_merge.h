@@ -2,11 +2,11 @@
 // K-way merge strategies for Phase B, shared by the GPU and CPU loaders so the
 // control group differs ONLY in where sorting happens.
 //
-// Chosen on measurements from bench/bench_kway_merge.cu (see context.md):
+// Chosen on measurements from bench/bench_kway_merge.cu (summarised in README.md):
 //
 //   IN-RAM regime (all runs cached) — pure CPU, no I/O at all, so the
 //   structure is the entire cost:
-//       binary heap      ~31 M entries/s   (what this project used before)
+//       binary heap      ~31 M entries/s   (baseline)
 //       loser tree       ~90 M entries/s   3x, single-threaded, drop-in
 //       partition+loser ~305 M entries/s   ~10x, and FLAT in k
 //   `partition` splits the OUTPUT into T disjoint key ranges and merges each
@@ -23,7 +23,7 @@
 // must cross PCIe twice, and 2 x N over PCIe (13.3 GB/s) is slower than doing
 // the whole merge in RAM (~14.6 GB/s effective).  Merging is only log2(k)
 // comparisons per element — far too little work per byte to amortise the
-// transfer, unlike sorting.  See context.md.
+// transfer, unlike sorting.
 
 #ifndef KWAY_MERGE_H
 #define KWAY_MERGE_H

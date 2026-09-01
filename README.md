@@ -243,7 +243,6 @@ break ties differently. Both are valid STR trees.
 | [`animation/`](animation/) | Manim scene, Python STR reference, tree-binary reader |
 | [`doc/`](doc/) | `resumo_expandido.md` (extended abstract, PT-BR) and rendered media |
 | [`references/`](references/) | The papers the gap was found in |
-| [`context.md`](context.md) | Working document: derivations, every measurement, methodology, open questions |
 
 ---
 

@@ -66,7 +66,7 @@ constexpr size_t MERGE_BUFFER_BYTES = 2ULL * 1024 * 1024 * 1024;     // 2 GB
 //
 // So the GPU sort chunk is capped here rather than at the GPU budget.  The
 // cost of a smaller chunk is more runs (k) for the merge, which raises the
-// heap merge's O(N log k) comparison count -- see the sweep in context.md.
+// heap merge's O(N log k) comparison count -- see bench/sweep_pinned_cap.sh.
 constexpr size_t MAX_PINNED_CHUNK_BYTES = 268435456ULL;   // 256 MB
 
 // Buffered page-append size for the (small) internal levels.
