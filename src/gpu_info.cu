@@ -1,5 +1,5 @@
 // gpu_info.cu
-// Displays GPU specifications to help configure constants.h
+// Displays GPU specifications to help configure rect_constants.h
 // Compile: nvcc -O3 gpu_info.cu -o gpu_info
 
 #include <cuda_runtime.h>
@@ -29,8 +29,8 @@ int main() {
 
         // For sort we need 1 buffer + Thrust scratch (~2x),
         // so usable is ~1/2 of safe memory
-        size_t sort_chunk_bytes  = safe_bytes / 2;
-        size_t sort_chunk_points = sort_chunk_bytes / 8;
+        size_t sort_chunk_bytes    = safe_bytes / 2;
+        size_t sort_chunk_entries  = sort_chunk_bytes / 24;  // sizeof(Entry)
 
         std::cout << "========================================\n"
                   << "GPU " << dev << ": " << prop.name << "\n"
@@ -51,11 +51,12 @@ int main() {
                   << "  L2 cache size:        " << prop.l2CacheSize / 1024
                   << " KB\n"
                   << "\n"
-                  << "--- Suggested constants.h values ---\n"
+                  << "--- Suggested rect_constants.h values ---\n"
                   << "  USABLE_GPU_BYTES:     " << safe_bytes
                   << "  (" << safe_gb << " GB)\n"
-                  << "  SORT_CHUNK_POINTS:    " << sort_chunk_points
-                  << "  (" << sort_chunk_points * 8.0 / (1024*1024) << " MB)\n"
+                  << "  sort chunk:           " << sort_chunk_entries
+                  << " entries  ("
+                  << sort_chunk_entries * 24.0 / (1024*1024) << " MB)\n"
                   << std::endl;
     }
 

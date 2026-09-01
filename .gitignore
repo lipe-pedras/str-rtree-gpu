@@ -18,6 +18,10 @@ src/gpu_info
 *.bin
 *.tmp
 
+# ── Animation output (rendered video + generated dataset) ──
+animation/media/
+animation/data/
+
 # ── Python ─────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
