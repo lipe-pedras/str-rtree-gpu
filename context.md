@@ -137,17 +137,20 @@ Every design decision in this project is an instance of that principle.
 |---|---|---|
 | GDDR6 (VRAM) | **192 GB/s** | 2.94 GB usable |
 | DDR5 (host RAM) | **76.8 GB/s** theoretical | 5 GB budgeted |
-| PCIe 4.0 | **31.5 GB/s** at x16 / 15.8 GB/s at x8, per direction | — (transit only) |
+| PCIe 4.0 x8 | **15.8 GB/s** theoretical, per direction | — (transit only) |
 | NVMe/SATA SSD | **~1–3 GB/s** | effectively unlimited |
 
-*(`nvidia-smi` reports link width max = x16, currently negotiated at x8 while
-idle. The width under sustained load must be confirmed — **[TODO — measure]**,
-it changes the break-even analysis below by 2×.)*
+*(`nvidia-smi` reports `pcie.link.width.max = 16, pcie.link.width.current = 8`.
+The x16 is the **GA107 die's** capability, not this machine's: the laptop wires the
+board at **x8**, and the link reads x8 idle and under sustained load alike. There is
+no downshift to catch and no x16 regime to measure — x8 is the ceiling. Confirmed
+from the other side by §12.3: 13.3 GB/s realized is 84% of x8 peak and would be a
+physically impossible 42% of x16.)*
 
 The ordering is the whole story: **the fastest tier is the smallest, and the
 only tier big enough to hold the data is ~100× slower than the one doing the
-work.** The GPU's 192 GB/s is gated behind a ~16–32 GB/s pipe, which is itself
-fed by a ~1–3 GB/s disk.
+work.** The GPU's 192 GB/s is gated behind a ~16 GB/s pipe, which is itself fed by
+a ~1–3 GB/s disk.
 
 ### 2.4 The break-even condition — the single most important number
 
@@ -162,8 +165,9 @@ chunk of *B* bytes the GPU path is worth taking only if:
 With `B` = 1.58 GB (`SORT_CHUNK_POINTS` = 197,564,825 points) and PCIe at a
 realistic ~13 GB/s effective on x8 with pinned memory, **the transfer tax alone
 is ≈ 243 ms per chunk**. The GPU sort must beat the CPU sort by more than that
-before the first millisecond of benefit appears. On x16 the tax halves to
-~120 ms.
+before the first millisecond of benefit appears. This tax is a fixed property of
+the machine, not a tuning knob: the board is wired x8 (§2.3), so there is no wider
+link to negotiate up to and the only lever is moving fewer bytes across it.
 
 This is exactly why the code goes to the trouble of:
 - **pinned host buffers** (`cudaMallocHost`) — pageable memory would force an
@@ -780,7 +784,7 @@ before/after figure of long thin rectangles versus square-ish ones.
 | Component | Spec |
 |---|---|
 | GPU | RTX 3050 Laptop — **3.68 GiB** VRAM, 16 SM, CC 8.6 (Ampere), 128-bit bus, 6001 MHz mem clock → **192 GB/s** |
-| PCIe | 4.0, max x16 (31.5 GB/s), negotiated x8 at idle |
+| PCIe | 4.0 x8 (15.8 GB/s per direction); the GA107 die reports a x16 max, but the board is wired x8 |
 | CPU | AMD Ryzen 5 6600H, 6C/12T |
 | RAM | 14 GB, DDR5-4800 dual channel → 76.8 GB/s theoretical |
 | Toolchain | CUDA 12.0, `nvcc -O3 -std=c++17 -arch=sm_86`, `g++ -O3 -std=c++17` |
@@ -1268,7 +1272,7 @@ blocker.
 | Question from Part I | Verdict |
 |---|---|
 | §2.4 — does the PCIe tax dominate? | **Confirmed.** 70% of GPU time at 16.7 M entries is transfer; realized 13.3 GB/s = 84% of PCIe 4.0 x8 peak. |
-| §2.3 — is the link x8 or x16 under load? | **x8.** 13.3 GB/s realized against 15.8 GB/s theoretical. |
+| §2.3 — does the link run below x16 under load? | **Wrong question.** The board is wired x8; x16 was never available, so nothing downshifts. 13.3 GB/s realized against 15.8 GB/s theoretical for x8. |
 | §4.5 — is the self-MBR layout worse for queries? | **Confirmed, and quantified.** Textbook layout achieves 166.9–170.0 pruning tests per page fetch; self-MBR's ceiling was 128. ~33% more pruning per I/O. |
 | §4.7 — do children blocks straddle pages? | **Moot.** The rewrite makes one node one aligned page by construction. |
 | §5.2 — is `thrust::sort` silently using merge sort? | **Confirmed and fixed.** `sort_by_key` on an extracted `uint32` key reaches `DeviceRadixSort`; 16.7 M entries sort in 26 ms. |
